@@ -1,0 +1,5 @@
+ultralytics>=8.3.0
+tqdm>=4.66.0
+numpy>=1.24.0
+pyside6>=6.7.0
+#ose-annotator-gui

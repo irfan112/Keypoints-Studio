@@ -1,0 +1,14 @@
+README.md
+pyproject.toml
+pose_annotator/__init__.py
+pose_annotator/__main__.py
+pose_annotator/auto_annotate.py
+pose_annotator/cli.py
+pose_annotator/formats.py
+pose_annotator/gui.py
+pose_annotator.egg-info/PKG-INFO
+pose_annotator.egg-info/SOURCES.txt
+pose_annotator.egg-info/dependency_links.txt
+pose_annotator.egg-info/entry_points.txt
+pose_annotator.egg-info/requires.txt
+pose_annotator.egg-info/top_level.txt

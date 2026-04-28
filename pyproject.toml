@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pose-annotator"
+version = "0.1.0"
+description = "YOLO pose auto-annotation for Ultralytics training format"
+requires-python = ">=3.9"
+dependencies = [
+    "ultralytics>=8.3.0",
+    "tqdm>=4.66.0",
+    "numpy>=1.24.0",
+    "pyside6>=6.7.0",
+]
+
+[project.scripts]
+pose-annotator = "pose_annotator.cli:main"
+pose-annotator-gui = "pose_annotator.gui:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["pose_annotator*"]
