@@ -14,15 +14,13 @@ Put your screenshots in the repository under `images/` and they will show here o
 
 - Main window:
 
-![Main window](images\GUI.png)
+![Main window](./images/GUI.png)
 
 - Mapping dialog:
 
-![Keypoint mapping](images\custom_keypoints.png)
+![Keypoint mapping](./images/custom_keypoints.png)
 
-- Editing (drag keypoints / resize bbox):
-
-![Editing overlay](images/screenshot-editing.png)
+> If images are not showing, confirm the files exist in the repo under `images/` and the filenames match exactly.
 
 ## Requirements
 
