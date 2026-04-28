@@ -1,0 +1,22 @@
+# Python / build
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+*.egg-info/
+dist/
+build/
+.venv/
+.env
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Model weights (do not commit)
+yolo26x-pose.pt
+*.pt
+*.pth
+
