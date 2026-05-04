@@ -46,6 +46,7 @@ from PySide6.QtWidgets import (
     QGraphicsView,
     QGraphicsPixmapItem,
     QGraphicsEllipseItem,
+    QGraphicsLineItem,
     QGraphicsRectItem,
     QGraphicsSimpleTextItem,
     QSizePolicy,
@@ -81,6 +82,8 @@ def _slot_color(slot: int) -> QColor:
 class ImageViewer(QGraphicsView):
     """Zoomable/pannable image viewer (mouse wheel zoom, drag to pan)."""
 
+    _ROLE_CROSSHAIR = int(Qt.ItemDataRole.UserRole) + 31
+
     def __init__(self) -> None:
         super().__init__()
         self._scene = QGraphicsScene(self)
@@ -95,9 +98,20 @@ class ImageViewer(QGraphicsView):
         self.setViewportUpdateMode(QGraphicsView.ViewportUpdateMode.FullViewportUpdate)
         self.setStyleSheet("QGraphicsView { background: #111; }")
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setMouseTracking(True)
 
         self._has_image = False
         self._click_handler = None
+
+        # Bbox guide mode (W): crosshair + drag rectangle
+        self._crosshair_mode = False
+        self._line_h: Optional[QGraphicsLineItem] = None
+        self._line_v: Optional[QGraphicsLineItem] = None
+        self._rubber: Optional[QGraphicsRectItem] = None
+        self._drag_start: Optional[QPointF] = None
+        self._bbox_complete_cb = None
+        self._middle_panning = False
+        self._middle_last_pos = QPointF()
 
     def set_placeholder(self, text: str) -> None:
         self._scene.clear()
@@ -134,11 +148,99 @@ class ImageViewer(QGraphicsView):
         for it in list(self._scene.items()):
             if it is self._pix_item:
                 continue
+            if it.data(self._ROLE_CROSSHAIR):
+                continue
             self._scene.removeItem(it)
 
     def fit_to_image(self) -> None:
         if self._has_image:
             self.fitInView(self._pix_item, Qt.AspectRatioMode.KeepAspectRatio)
+
+    def set_crosshair_bbox_mode(
+        self,
+        enabled: bool,
+        on_complete_bbox=None,
+    ) -> None:
+        """Enable/disable crosshair + drag-to-draw bbox (scene coordinates)."""
+        self._crosshair_mode = bool(enabled)
+        self._bbox_complete_cb = on_complete_bbox
+        self._drag_start = None
+        if self._rubber is not None:
+            try:
+                self._scene.removeItem(self._rubber)
+            except Exception:
+                pass
+            self._rubber = None
+
+        if not enabled:
+            self._bbox_complete_cb = None
+            self._remove_crosshair_graphics()
+            self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+            self._middle_panning = False
+            return
+
+        self.setDragMode(QGraphicsView.DragMode.NoDrag)
+        self.setCursor(Qt.CursorShape.CrossCursor)
+        self._ensure_crosshair_lines()
+        self._update_crosshair_at_scene(self.mapToScene(self.viewport().rect().center()))
+
+    def _remove_crosshair_graphics(self) -> None:
+        for it in (self._line_h, self._line_v):
+            if it is None:
+                continue
+            try:
+                self._scene.removeItem(it)
+            except Exception:
+                pass
+        self._line_h = None
+        self._line_v = None
+
+    def _ensure_crosshair_lines(self) -> None:
+        if self._line_h is None:
+            self._line_h = QGraphicsLineItem()
+            self._line_h.setData(self._ROLE_CROSSHAIR, True)
+            self._line_h.setZValue(99)
+            self._line_h.setPen(QPen(QColor(0, 255, 200, 220), 1))
+            self._scene.addItem(self._line_h)
+        if self._line_v is None:
+            self._line_v = QGraphicsLineItem()
+            self._line_v.setData(self._ROLE_CROSSHAIR, True)
+            self._line_v.setZValue(99)
+            self._line_v.setPen(QPen(QColor(0, 255, 200, 220), 1))
+            self._scene.addItem(self._line_v)
+
+    def _clamp_scene_pos(self, p: QPointF) -> QPointF:
+        r = self._scene.sceneRect()
+        return QPointF(
+            float(min(max(p.x(), r.left()), r.right())),
+            float(min(max(p.y(), r.top()), r.bottom())),
+        )
+
+    def _update_crosshair_at_scene(self, p: QPointF) -> None:
+        if not self._crosshair_mode or not self._has_image:
+            return
+        self._ensure_crosshair_lines()
+        sr = self._scene.sceneRect()
+        x, y = p.x(), p.y()
+        self._line_h.setLine(sr.left(), y, sr.right(), y)
+        self._line_v.setLine(x, sr.top(), x, sr.bottom())
+
+    def _update_rubber(self, p1: QPointF, p2: QPointF) -> None:
+        x1 = min(p1.x(), p2.x())
+        y1 = min(p1.y(), p2.y())
+        x2 = max(p1.x(), p2.x())
+        y2 = max(p1.y(), p2.y())
+        rect = QRectF(x1, y1, x2 - x1, y2 - y1)
+        if self._rubber is None:
+            self._rubber = QGraphicsRectItem(rect)
+            self._rubber.setData(self._ROLE_CROSSHAIR, True)
+            self._rubber.setZValue(98)
+            self._rubber.setPen(QPen(QColor(255, 220, 60, 240), 1, Qt.PenStyle.DashLine))
+            self._rubber.setBrush(QBrush(QColor(255, 220, 60, 40)))
+            self._scene.addItem(self._rubber)
+        else:
+            self._rubber.setRect(rect)
 
     def wheelEvent(self, event) -> None:  # type: ignore[override]
         if not self._has_image:
@@ -150,7 +252,43 @@ class ImageViewer(QGraphicsView):
         factor = 1.25 if delta > 0 else 0.8
         self.scale(factor, factor)
 
+    def mouseMoveEvent(self, event) -> None:  # type: ignore[override]
+        if self._middle_panning and self._has_image:
+            delta = QPointF(event.pos()) - self._middle_last_pos
+            self._middle_last_pos = QPointF(event.pos())
+            self.horizontalScrollBar().setValue(
+                int(self.horizontalScrollBar().value() - delta.x())
+            )
+            self.verticalScrollBar().setValue(
+                int(self.verticalScrollBar().value() - delta.y())
+            )
+            event.accept()
+            return
+
+        if self._crosshair_mode and self._has_image:
+            sp = self._clamp_scene_pos(self.mapToScene(event.pos()))
+            self._update_crosshair_at_scene(sp)
+            if self._drag_start is not None:
+                self._update_rubber(self._drag_start, sp)
+            event.accept()
+            return
+
+        return super().mouseMoveEvent(event)
+
     def mousePressEvent(self, event) -> None:  # type: ignore[override]
+        if self._crosshair_mode and self._has_image:
+            if event.button() == Qt.MouseButton.MiddleButton:
+                self._middle_panning = True
+                self._middle_last_pos = QPointF(event.pos())
+                event.accept()
+                return
+            if event.button() == Qt.MouseButton.LeftButton:
+                sp = self._clamp_scene_pos(self.mapToScene(event.pos()))
+                self._drag_start = QPointF(sp)
+                self._update_rubber(sp, sp)
+                event.accept()
+                return
+
         if (
             self._has_image
             and self._click_handler is not None
@@ -161,6 +299,33 @@ class ImageViewer(QGraphicsView):
             event.accept()
             return
         return super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # type: ignore[override]
+        if event.button() == Qt.MouseButton.MiddleButton:
+            self._middle_panning = False
+            event.accept()
+            return super().mouseReleaseEvent(event)
+
+        if self._crosshair_mode and self._has_image and event.button() == Qt.MouseButton.LeftButton:
+            if self._drag_start is not None:
+                sp = self._clamp_scene_pos(self.mapToScene(event.pos()))
+                x1 = min(self._drag_start.x(), sp.x())
+                y1 = min(self._drag_start.y(), sp.y())
+                x2 = max(self._drag_start.x(), sp.x())
+                y2 = max(self._drag_start.y(), sp.y())
+                self._drag_start = None
+                if self._rubber is not None:
+                    try:
+                        self._scene.removeItem(self._rubber)
+                    except Exception:
+                        pass
+                    self._rubber = None
+                if (x2 - x1) >= 3.0 and (y2 - y1) >= 3.0 and self._bbox_complete_cb:
+                    self._bbox_complete_cb(float(x1), float(y1), float(x2), float(y2))
+            event.accept()
+            return
+
+        return super().mouseReleaseEvent(event)
 
     def keyPressEvent(self, event) -> None:  # type: ignore[override]
         # Let parent handle deletes on selected keypoints.
@@ -760,7 +925,12 @@ class MainWindow(QMainWindow):
         # Detection delete flag: hides bbox and skips saving, but keeps keypoints visible/editable.
         self._det_deleted: Optional[np.ndarray] = None  # (N,) bool
         self._add_mode = False
+        self._bbox_guide_mode = False
         self._autosave_enabled = False
+        # Last bbox copied when navigating away (for Ctrl+V on the next image).
+        self._bbox_clipboard: Optional[tuple[np.ndarray, np.ndarray, np.ndarray]] = None
+        # Last person's keypoints (normalized x,y in [0,1]) when navigating away — Ctrl+B paste.
+        self._kpts_clipboard: Optional[np.ndarray] = None
         self._overlay_rects: list[QGraphicsRectItem] = []
         self._overlay_kps: list[DraggableKeypoint] = []
 
@@ -877,6 +1047,15 @@ class MainWindow(QMainWindow):
         self.viewer.set_placeholder("Select an images folder to begin.")
         preview_layout.addWidget(self.viewer)
 
+        # Paste bbox: only when preview has focus (so Ctrl+V still works in text fields).
+        self._shortcut_paste_bbox = QShortcut(QKeySequence.StandardKey.Paste, self.viewer)
+        self._shortcut_paste_bbox.setContext(Qt.ShortcutContext.WidgetShortcut)
+        self._shortcut_paste_bbox.activated.connect(self.paste_clipboard_bbox)
+
+        self._shortcut_paste_kpts = QShortcut(QKeySequence("Ctrl+B"), self.viewer)
+        self._shortcut_paste_kpts.setContext(Qt.ShortcutContext.WidgetShortcut)
+        self._shortcut_paste_kpts.activated.connect(self.paste_clipboard_keypoints)
+
         # Right-side tool panel (will be placed to the far right)
         self.prev_btn = QPushButton("Previous")
         self.next_btn = QPushButton("Next")
@@ -904,6 +1083,10 @@ class MainWindow(QMainWindow):
         self._shortcut_next = QShortcut(QKeySequence("D"), self)
         self._shortcut_next.setContext(Qt.ShortcutContext.ApplicationShortcut)
         self._shortcut_next.activated.connect(self.next_image)
+
+        self._shortcut_bbox_guide = QShortcut(QKeySequence("W"), self)
+        self._shortcut_bbox_guide.setContext(Qt.ShortcutContext.ApplicationShortcut)
+        self._shortcut_bbox_guide.activated.connect(self.toggle_bbox_guide_mode)
 
         self.add_mode_btn = QPushButton("Add keypoint")
         self.add_mode_btn.setCheckable(True)
@@ -1268,6 +1451,8 @@ class MainWindow(QMainWindow):
         if self.state.index > 0:
             if not self._maybe_autosave_current_before_navigation():
                 return
+            self._capture_bbox_clipboard_from_current_image()
+            self._capture_kpts_clipboard_from_current_image()
             self.state.index -= 1
             self._update_buttons()
             self._update_current_image_labels()
@@ -1277,10 +1462,177 @@ class MainWindow(QMainWindow):
         if self.state.index < len(self.state.images) - 1:
             if not self._maybe_autosave_current_before_navigation():
                 return
+            self._capture_bbox_clipboard_from_current_image()
+            self._capture_kpts_clipboard_from_current_image()
             self.state.index += 1
             self._update_buttons()
             self._update_current_image_labels()
             self.predict_current()
+
+    def _last_bbox_person_index(self) -> Optional[int]:
+        """Last row index that still has a visible bbox (not bbox-deleted)."""
+        if self._edit_xyxy is None or self._edit_xyxy.shape[0] == 0:
+            return None
+        n = int(self._edit_xyxy.shape[0])
+        del_m = (
+            self._det_deleted
+            if self._det_deleted is not None
+            else np.zeros((n,), dtype=bool)
+        )
+        for i in range(n - 1, -1, -1):
+            if not bool(del_m[i]):
+                return i
+        return None
+
+    def _last_keypoints_source_person_index(self) -> Optional[int]:
+        """Person row to copy keypoints from: prefer last visible bbox; else last row with any kp."""
+        i = self._last_bbox_person_index()
+        if i is not None:
+            return i
+        if self._edit_kpts_xyv is None or self._edit_kpts_xyv.shape[0] == 0:
+            return None
+        n = int(self._edit_kpts_xyv.shape[0])
+        for j in range(n - 1, -1, -1):
+            if np.any(self._edit_kpts_xyv[j, :, 2] > 0):
+                return j
+        return None
+
+    def _read_image_wh(self, image_path: Path) -> Optional[tuple[int, int]]:
+        try:
+            import cv2  # type: ignore
+
+            bgr = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+            if bgr is None:
+                return None
+            return int(bgr.shape[1]), int(bgr.shape[0])
+        except Exception:
+            return None
+
+    def _capture_bbox_clipboard_from_current_image(self) -> None:
+        """Remember the last visible bbox on the current image (used after Next/Prev)."""
+        if (
+            self._edit_xyxy is None
+            or self._edit_kpts_xyv is None
+            or self._edit_cls is None
+            or self._edit_xyxy.shape[0] == 0
+        ):
+            self._bbox_clipboard = None
+            return
+        idx = self._last_bbox_person_index()
+        if idx is None:
+            self._bbox_clipboard = None
+            return
+        self._bbox_clipboard = (
+            self._edit_xyxy[idx : idx + 1].copy(),
+            self._edit_kpts_xyv[idx : idx + 1].copy(),
+            self._edit_cls[idx : idx + 1].copy(),
+        )
+
+    def _capture_kpts_clipboard_from_current_image(self) -> None:
+        """Remember keypoints for the source person as normalized x,y (matches bbox source when possible)."""
+        if self._edit_kpts_xyv is None or not self.state.images:
+            self._kpts_clipboard = None
+            return
+        idx = self._last_keypoints_source_person_index()
+        if idx is None:
+            self._kpts_clipboard = None
+            return
+        wh = self._read_image_wh(self._current_image())
+        if wh is None:
+            self._kpts_clipboard = None
+            return
+        w, h = wh[0], wh[1]
+        if w <= 0 or h <= 0:
+            self._kpts_clipboard = None
+            return
+        row = self._edit_kpts_xyv[idx].astype(np.float64).copy()
+        row[:, 0] /= float(w)
+        row[:, 1] /= float(h)
+        self._kpts_clipboard = row
+
+    def paste_clipboard_bbox(self) -> None:
+        """Paste bbox copied from the previous image (Ctrl+V / standard Paste)."""
+        if not self.state.images:
+            return
+        if self._bbox_clipboard is None:
+            self.status.setText(
+                "No bbox to paste: draw or load a bbox on an image, then use Next/Previous."
+            )
+            return
+        if self._edit_xyxy is None or self._edit_kpts_xyv is None or self._edit_cls is None:
+            if not self._ensure_image_loaded_empty_editable():
+                self.status.setText("Load this image (Predict / Preview) before pasting a bbox.")
+                return
+
+        xy_src, kp_src, cls_src = self._bbox_clipboard
+        out_k = int(self._edit_kpts_xyv.shape[1])
+        src_k = int(kp_src.shape[1])
+        kp_adj = np.zeros((xy_src.shape[0], out_k, 3), dtype=np.float64)
+        k_use = min(out_k, src_k)
+        if k_use > 0:
+            kp_adj[:, :k_use, :] = kp_src[:, :k_use, :]
+
+        if self._det_deleted is None:
+            self._det_deleted = np.zeros((self._edit_xyxy.shape[0],), dtype=bool)
+
+        self._edit_xyxy = np.vstack([self._edit_xyxy, xy_src.astype(np.float64)])
+        self._edit_kpts_xyv = np.vstack([self._edit_kpts_xyv, kp_adj])
+        self._edit_cls = np.concatenate([self._edit_cls, cls_src.astype(np.int64)])
+        self._det_deleted = np.concatenate(
+            [self._det_deleted, np.zeros((xy_src.shape[0],), dtype=bool)]
+        )
+        self.add_person_spin.setRange(1, max(1, int(self._edit_xyxy.shape[0])))
+        self._render_editable_overlay(fit=False)
+        self._update_present_keypoints_list()
+        self.status.setText("Pasted bbox from previous image (Ctrl+V).")
+
+    def paste_clipboard_keypoints(self) -> None:
+        """Paste keypoints from previous image onto selected Person (Ctrl+B). Coords rescale to current image size."""
+        if not self.state.images:
+            return
+        if self._kpts_clipboard is None:
+            self.status.setText(
+                "No keypoints to paste: edit or load keypoints on an image, then Next/Previous."
+            )
+            return
+        if (
+            self._edit_xyxy is None
+            or self._edit_kpts_xyv is None
+            or self._edit_xyxy.shape[0] == 0
+        ):
+            self.status.setText(
+                "Need at least one person on this frame (bbox). Run Predict or paste a bbox (Ctrl+V), then try Ctrl+B."
+            )
+            return
+
+        person_idx = int(self.add_person_spin.value()) - 1
+        if person_idx < 0 or person_idx >= self._edit_kpts_xyv.shape[0]:
+            self.status.setText("Invalid Person # for keypoint paste.")
+            return
+
+        wh = self._read_image_wh(self._current_image())
+        if wh is None:
+            self.status.setText("Could not read current image size for paste.")
+            return
+        w, h = wh[0], wh[1]
+
+        out_k = int(self._edit_kpts_xyv.shape[1])
+        src_k = int(self._kpts_clipboard.shape[0])
+        k_use = min(out_k, src_k)
+
+        restored = np.zeros((out_k, 3), dtype=np.float64)
+        if k_use > 0:
+            chunk = self._kpts_clipboard[:k_use].astype(np.float64).copy()
+            chunk[:, 0] *= float(w)
+            chunk[:, 1] *= float(h)
+            restored[:k_use, :] = chunk
+
+        self._edit_kpts_xyv[person_idx, :, :] = restored
+        self._render_editable_overlay(fit=False)
+        self._update_present_keypoints_list()
+        self.status.setText(
+            f"Pasted keypoints from previous image onto Person {person_idx + 1} (Ctrl+B)."
+        )
 
     def _on_autosave_toggled(self, checked: bool) -> None:
         self._autosave_enabled = bool(checked)
@@ -1345,6 +1697,7 @@ class MainWindow(QMainWindow):
                 self._load_editable_from_label_file(label_path, img_path)
                 self._render_editable_overlay(fit=True)
                 self._update_present_keypoints_list()
+                self.viewer.setFocus(Qt.FocusReason.OtherFocusReason)
                 return
 
             model = self._ensure_model()
@@ -1369,6 +1722,7 @@ class MainWindow(QMainWindow):
             self._load_editable_from_result(results[0], img_path)
             self._render_editable_overlay(fit=True)
             self._update_present_keypoints_list()
+            self.viewer.setFocus(Qt.FocusReason.OtherFocusReason)
         except Exception:
             self._show_error("Predict failed", traceback.format_exc())
 
@@ -1625,14 +1979,98 @@ class MainWindow(QMainWindow):
     def toggle_add_mode(self, enabled: bool) -> None:
         self._add_mode = bool(enabled)
         if self._add_mode:
+            if getattr(self, "_bbox_guide_mode", False):
+                self._bbox_guide_mode = False
+                self.viewer.set_crosshair_bbox_mode(False)
             self.viewer.setDragMode(QGraphicsView.DragMode.NoDrag)
             self.viewer.setCursor(Qt.CursorShape.CrossCursor)
             self.viewer.set_click_handler(self._on_add_click)
             self.status.setText("Add mode: click on image to place selected keypoint.")
         else:
             self.viewer.set_click_handler(None)
-            self.viewer.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
-            self.viewer.setCursor(Qt.CursorShape.ArrowCursor)
+            if getattr(self, "_bbox_guide_mode", False):
+                self.viewer.setDragMode(QGraphicsView.DragMode.NoDrag)
+                self.viewer.setCursor(Qt.CursorShape.CrossCursor)
+            else:
+                self.viewer.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
+                self.viewer.setCursor(Qt.CursorShape.ArrowCursor)
+
+    def toggle_bbox_guide_mode(self) -> None:
+        """Toggle crosshair + drag-to-draw bbox (shortcut W)."""
+        if not self.state.images:
+            self.status.setText("Select an images folder first.")
+            return
+        if self._edit_xyxy is None or self._edit_kpts_xyv is None or self._edit_cls is None:
+            if not self._ensure_image_loaded_empty_editable():
+                self.status.setText("Could not load the image for manual bbox drawing.")
+                return
+        if self._det_deleted is None:
+            self._det_deleted = np.zeros((self._edit_xyxy.shape[0],), dtype=bool)
+
+        self._bbox_guide_mode = not self._bbox_guide_mode
+        if self._bbox_guide_mode:
+            if self.add_mode_btn.isChecked():
+                self.add_mode_btn.setChecked(False)
+                self.toggle_add_mode(False)
+            self.viewer.set_click_handler(None)
+            self.viewer.set_crosshair_bbox_mode(True, self._on_manual_bbox_complete)
+            self.status.setText(
+                "Bbox guide (W): crosshair follows the pointer. "
+                "Drag with left button from the crosshair; release sets the opposite corner. "
+                "Middle-drag to pan. Press W again to exit."
+            )
+        else:
+            self.viewer.set_crosshair_bbox_mode(False)
+            self.status.setText("Bbox guide off.")
+
+    def _ensure_image_loaded_empty_editable(self) -> bool:
+        """Load current image and initialize empty label arrays (manual bbox / empty label)."""
+        try:
+            import cv2  # type: ignore
+        except Exception:
+            return False
+        if not self.state.images:
+            return False
+        img_path = self._current_image()
+        bgr = cv2.imread(str(img_path), cv2.IMREAD_COLOR)
+        if bgr is None:
+            return False
+        rgb = bgr[..., ::-1].copy()
+        self.viewer.set_base_pixmap(_to_qpixmap(rgb), fit=True)
+        defs = self._active_defs()
+        out_k = max(17, max(defs.keys()) if defs else 17)
+        self._edit_xyxy = np.zeros((0, 4), dtype=np.float64)
+        self._edit_kpts_xyv = np.zeros((0, out_k, 3), dtype=np.float64)
+        self._edit_cls = np.zeros((0,), dtype=np.int64)
+        self._det_deleted = np.zeros((0,), dtype=bool)
+        self.add_person_spin.setRange(1, 1)
+        self.add_person_spin.setValue(1)
+        return True
+
+    def _on_manual_bbox_complete(
+        self, x1: float, y1: float, x2: float, y2: float
+    ) -> None:
+        if self._edit_xyxy is None or self._edit_kpts_xyv is None or self._edit_cls is None:
+            return
+        if self._det_deleted is None:
+            self._det_deleted = np.zeros((self._edit_xyxy.shape[0],), dtype=bool)
+        out_k = self._edit_kpts_xyv.shape[1]
+        row = np.array([[x1, y1, x2, y2]], dtype=np.float64)
+        krow = np.zeros((1, out_k, 3), dtype=np.float64)
+        self._edit_xyxy = np.vstack([self._edit_xyxy, row])
+        self._edit_kpts_xyv = np.vstack([self._edit_kpts_xyv, krow])
+        self._edit_cls = np.concatenate(
+            [self._edit_cls, np.array([0], dtype=np.int64)]
+        )
+        self._det_deleted = np.concatenate(
+            [self._det_deleted, np.array([False], dtype=bool)]
+        )
+        self.add_person_spin.setRange(1, max(1, self._edit_xyxy.shape[0]))
+        self._render_editable_overlay(fit=False)
+        self._update_present_keypoints_list()
+        self.status.setText(
+            f"Added bbox ({self._edit_xyxy.shape[0]} total). Drag corners to adjust. Press W to exit guide."
+        )
 
     def _on_add_click(self, sx: float, sy: float) -> None:
         """Place/move a keypoint for the selected person."""
