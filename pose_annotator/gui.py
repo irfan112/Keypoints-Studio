@@ -927,8 +927,8 @@ class MainWindow(QMainWindow):
         self._add_mode = False
         self._bbox_guide_mode = False
         self._autosave_enabled = False
-        # Last bbox copied when navigating away (for Ctrl+V on the next image).
-        self._bbox_clipboard: Optional[tuple[np.ndarray, np.ndarray, np.ndarray]] = None
+        # Last bbox (xyxy normalized to source image) + class when navigating away — Ctrl+V only replaces bbox.
+        self._bbox_clipboard: Optional[tuple[np.ndarray, np.ndarray]] = None
         # Last person's keypoints (normalized x,y in [0,1]) when navigating away — Ctrl+B paste.
         self._kpts_clipboard: Optional[np.ndarray] = None
         self._overlay_rects: list[QGraphicsRectItem] = []
@@ -1509,10 +1509,9 @@ class MainWindow(QMainWindow):
             return None
 
     def _capture_bbox_clipboard_from_current_image(self) -> None:
-        """Remember the last visible bbox on the current image (used after Next/Prev)."""
+        """Remember the last visible bbox (normalized xyxy) + class — keypoints use separate clipboard (Ctrl+B)."""
         if (
             self._edit_xyxy is None
-            or self._edit_kpts_xyv is None
             or self._edit_cls is None
             or self._edit_xyxy.shape[0] == 0
         ):
@@ -1522,9 +1521,22 @@ class MainWindow(QMainWindow):
         if idx is None:
             self._bbox_clipboard = None
             return
+        wh = self._read_image_wh(self._current_image())
+        if wh is None:
+            self._bbox_clipboard = None
+            return
+        w, h = wh[0], wh[1]
+        if w <= 0 or h <= 0:
+            self._bbox_clipboard = None
+            return
+        xy = self._edit_xyxy[idx].astype(np.float64).copy().reshape(4)
+        xy_norm = xy.copy()
+        xy_norm[0] /= float(w)
+        xy_norm[2] /= float(w)
+        xy_norm[1] /= float(h)
+        xy_norm[3] /= float(h)
         self._bbox_clipboard = (
-            self._edit_xyxy[idx : idx + 1].copy(),
-            self._edit_kpts_xyv[idx : idx + 1].copy(),
+            xy_norm.reshape(1, 4),
             self._edit_cls[idx : idx + 1].copy(),
         )
 
@@ -1551,7 +1563,7 @@ class MainWindow(QMainWindow):
         self._kpts_clipboard = row
 
     def paste_clipboard_bbox(self) -> None:
-        """Paste bbox copied from the previous image (Ctrl+V / standard Paste)."""
+        """Paste bbox only from previous image (Ctrl+V). Replaces bbox + class for selected Person; keypoints unchanged."""
         if not self.state.images:
             return
         if self._bbox_clipboard is None:
@@ -1564,27 +1576,49 @@ class MainWindow(QMainWindow):
                 self.status.setText("Load this image (Predict / Preview) before pasting a bbox.")
                 return
 
-        xy_src, kp_src, cls_src = self._bbox_clipboard
-        out_k = int(self._edit_kpts_xyv.shape[1])
-        src_k = int(kp_src.shape[1])
-        kp_adj = np.zeros((xy_src.shape[0], out_k, 3), dtype=np.float64)
-        k_use = min(out_k, src_k)
-        if k_use > 0:
-            kp_adj[:, :k_use, :] = kp_src[:, :k_use, :]
+        xy_norm_arr, cls_src = self._bbox_clipboard
+        wh = self._read_image_wh(self._current_image())
+        if wh is None:
+            self.status.setText("Could not read current image size for bbox paste.")
+            return
+        W, H = wh[0], wh[1]
+        xy_norm = xy_norm_arr[0].astype(np.float64).copy()
+        xy_px = xy_norm.copy()
+        xy_px[0] *= float(W)
+        xy_px[2] *= float(W)
+        xy_px[1] *= float(H)
+        xy_px[3] *= float(H)
+
+        person_idx = int(self.add_person_spin.value()) - 1
+        n = int(self._edit_xyxy.shape[0])
 
         if self._det_deleted is None:
-            self._det_deleted = np.zeros((self._edit_xyxy.shape[0],), dtype=bool)
+            self._det_deleted = np.zeros((n,), dtype=bool)
 
-        self._edit_xyxy = np.vstack([self._edit_xyxy, xy_src.astype(np.float64)])
-        self._edit_kpts_xyv = np.vstack([self._edit_kpts_xyv, kp_adj])
-        self._edit_cls = np.concatenate([self._edit_cls, cls_src.astype(np.int64)])
-        self._det_deleted = np.concatenate(
-            [self._det_deleted, np.zeros((xy_src.shape[0],), dtype=bool)]
-        )
-        self.add_person_spin.setRange(1, max(1, int(self._edit_xyxy.shape[0])))
+        if n > 0 and 0 <= person_idx < n:
+            self._edit_xyxy[person_idx] = xy_px
+            self._edit_cls[person_idx] = int(cls_src[0])
+            self._det_deleted[person_idx] = False
+            self.status.setText(
+                f"Replaced bbox for Person {person_idx + 1} (Ctrl+V). Keypoints unchanged — use Ctrl+B for keypoints."
+            )
+        else:
+            out_k = int(self._edit_kpts_xyv.shape[1])
+            self._edit_xyxy = np.vstack([self._edit_xyxy, xy_px.reshape(1, 4)])
+            self._edit_kpts_xyv = np.vstack(
+                [self._edit_kpts_xyv, np.zeros((1, out_k, 3), dtype=np.float64)]
+            )
+            self._edit_cls = np.concatenate([self._edit_cls, cls_src.astype(np.int64)])
+            self._det_deleted = np.concatenate(
+                [self._det_deleted, np.zeros((1,), dtype=bool)]
+            )
+            self.add_person_spin.setRange(1, max(1, int(self._edit_xyxy.shape[0])))
+            self.status.setText(
+                "Added bbox from previous image (Ctrl+V). Keypoints empty for new person — use Ctrl+B to paste keypoints."
+            )
+
         self._render_editable_overlay(fit=False)
         self._update_present_keypoints_list()
-        self.status.setText("Pasted bbox from previous image (Ctrl+V).")
 
     def paste_clipboard_keypoints(self) -> None:
         """Paste keypoints from previous image onto selected Person (Ctrl+B). Coords rescale to current image size."""
