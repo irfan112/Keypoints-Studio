@@ -7,6 +7,7 @@ import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+import shutil
 
 import numpy as np
 from PySide6.QtCore import QObject, QPointF, QRectF, Qt, QThread, Signal
@@ -53,9 +54,11 @@ from PySide6.QtWidgets import (
     QStyle,
     QMenu,
     QScrollArea,
+    QStackedWidget,
 )
 from ultralytics import YOLO
 
+from pose_annotator.ar_page import ActionRecognitionPage
 from pose_annotator.auto_annotate import iter_images, run_auto_annotate
 from pose_annotator.formats import PoseLabelLine
 
@@ -426,10 +429,45 @@ class DraggableKeypoint(QGraphicsEllipseItem):
 
     def contextMenuEvent(self, event) -> None:  # type: ignore[override]
         menu = QMenu()
-        act = menu.addAction("Delete keypoint")
+        menu.setTitle("Keypoint")
+
+        mw = self.scene().views()[0].window() if self.scene() and self.scene().views() else None
+
+        title = menu.addAction(f"Person {self.person_idx + 1}  •  Keypoint {int(self.out_slot)}")
+        title.setEnabled(False)
+        menu.addSeparator()
+
+        change_menu = menu.addMenu("Change keypoint number")
+
+        # Build optimized list from active schema
+        defs = None
+        if mw is not None and hasattr(mw, "_active_defs"):
+            try:
+                defs = mw._active_defs()  # type: ignore[attr-defined]
+            except Exception:
+                defs = None
+
+        actions_by_slot: dict[int, object] = {}
+        if defs:
+            for slot in sorted(defs.keys()):
+                d = defs[slot]
+                txt = f"{int(d.slot):>2}. {d.name}"
+                a = change_menu.addAction(txt)
+                a.setCheckable(True)
+                a.setChecked(int(slot) == int(self.out_slot))
+                actions_by_slot[int(slot)] = a
+        else:
+            a = change_menu.addAction("(schema unavailable)")
+            a.setEnabled(False)
+
+        menu.addSeparator()
+        act_delete = menu.addAction("Delete keypoint")
+
         chosen = menu.exec(event.screenPos())
-        if chosen == act:
-            mw = self.scene().views()[0].window() if self.scene() and self.scene().views() else None
+        if chosen is None:
+            return
+
+        if chosen == act_delete:
             if mw is not None and hasattr(mw, "delete_keypoint"):
                 mw.delete_keypoint(self.person_idx, self.out_slot)  # type: ignore[attr-defined]
             else:
@@ -444,6 +482,15 @@ class DraggableKeypoint(QGraphicsEllipseItem):
                     pass
             event.accept()
             return
+
+        # Change slot
+        for slot, act in actions_by_slot.items():
+            if chosen == act:
+                if mw is not None and hasattr(mw, "change_keypoint_slot"):
+                    mw.change_keypoint_slot(self.person_idx, self.out_slot, slot)  # type: ignore[attr-defined]
+                    event.accept()
+                    return
+                break
         return super().contextMenuEvent(event)
 
 
@@ -598,6 +645,12 @@ def _default_keypoint_defs() -> dict[int, KeypointDef]:
     return out
 
 
+def _custom_classes_path() -> Path:
+    """Return path to data/custom_classes.txt (if present)."""
+    here = Path(__file__).resolve()
+    return here.parent.parent / "data" / "custom_classes.txt"
+
+
 def _defs_to_text(defs: dict[int, KeypointDef]) -> str:
     # HTML so we can color only "custom" markers red.
     def esc(s: str) -> str:
@@ -608,7 +661,9 @@ def _defs_to_text(defs: dict[int, KeypointDef]) -> str:
             .replace('"', "&quot;")
         )
 
-    lines: list[str] = ["<b>Keypoints (output slot):</b>"]
+    lines: list[str] = [
+        '<span style="color:#c62828;"><b>Keypoints (output slot):</b></span>'
+    ]
     for s in sorted(defs.keys()):
         d = defs[s]
         if d.source == "custom":
@@ -839,13 +894,18 @@ class MappingDialog(QDialog):
 
 @dataclass
 class AppState:
+    root_dir: Optional[Path] = None
     images_dir: Optional[Path] = None
     images: list[Path] = None  # type: ignore[assignment]
     index: int = 0
+    folders: list[Path] = None  # type: ignore[assignment]
+    folder_index: int = 0
 
     def __post_init__(self) -> None:
         if self.images is None:
             self.images = []
+        if self.folders is None:
+            self.folders = []
 
 
 class AnnotateWorker(QObject):
@@ -919,6 +979,7 @@ class MainWindow(QMainWindow):
         self._thread: Optional[QThread] = None
         self._worker: Optional[AnnotateWorker] = None
         self._kp_defs: dict[int, KeypointDef] = _default_keypoint_defs()
+        self._load_custom_keypoints_from_file()
         self._edit_xyxy: Optional[np.ndarray] = None  # (N,4) xyxy pixels
         self._edit_kpts_xyv: Optional[np.ndarray] = None  # (N,K,3) pixels + vis
         self._edit_cls: Optional[np.ndarray] = None  # (N,) int
@@ -934,8 +995,8 @@ class MainWindow(QMainWindow):
         self._overlay_rects: list[QGraphicsRectItem] = []
         self._overlay_kps: list[DraggableKeypoint] = []
 
-        root = QWidget()
-        outer = QHBoxLayout(root)
+        pose_root = QWidget()
+        outer = QHBoxLayout(pose_root)
         outer.setContentsMargins(8, 8, 8, 8)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -948,20 +1009,75 @@ class MainWindow(QMainWindow):
         controls = QGroupBox("Project")
         controls_layout = QGridLayout(controls)
 
+        self.switch_ar_btn = QPushButton("Switch AR")
+        self.switch_ar_btn.setToolTip(
+            "Switch to Action Recognition mode — draw bounding boxes and assign classes (labelImg-style)."
+        )
+        self.switch_ar_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.switch_ar_btn.setMinimumHeight(36)
+        self.switch_ar_btn.setStyleSheet(
+            """
+            QPushButton {
+                background-color: #1e40af;
+                color: #ffffff;
+                font-weight: 600;
+                font-size: 13px;
+                padding: 8px 16px;
+                border: none;
+                border-radius: 8px;
+            }
+            QPushButton:hover {
+                background-color: #2563eb;
+            }
+            QPushButton:pressed {
+                background-color: #1e3a8a;
+                padding-top: 9px;
+                padding-bottom: 7px;
+            }
+            QPushButton:disabled {
+                background-color: #64748b;
+                color: #e2e8f0;
+            }
+            """
+        )
+        self.switch_ar_btn.clicked.connect(lambda: self._set_annotation_mode(1))
+        controls_layout.addWidget(self.switch_ar_btn, 0, 0, 1, 3)
+
         self.images_dir_edit = QLineEdit()
         self.images_dir_edit.setReadOnly(True)
 
-        btn_pick = QPushButton("Select Images Folder…")
-        btn_pick.clicked.connect(self.pick_images_dir)
+        btn_pick = QPushButton("Select Root Directory…")
+        btn_pick.clicked.connect(self.pick_root_dir)
 
-        controls_layout.addWidget(QLabel("Images folder"), 0, 0)
-        controls_layout.addWidget(self.images_dir_edit, 0, 1)
-        controls_layout.addWidget(btn_pick, 0, 2)
+        self.prev_folder_btn = QPushButton("Previous folder")
+        self.next_folder_btn = QPushButton("Next folder")
+        self.prev_folder_btn.clicked.connect(self.prev_folder)
+        self.next_folder_btn.clicked.connect(self.next_folder)
+        self.prev_folder_btn.setEnabled(False)
+        self.next_folder_btn.setEnabled(False)
+
+        controls_layout.addWidget(QLabel("Root directory"), 1, 0)
+        controls_layout.addWidget(self.images_dir_edit, 1, 1)
+        controls_layout.addWidget(btn_pick, 1, 2)
+
+        folder_row = QHBoxLayout()
+        folder_row.addWidget(self.prev_folder_btn)
+        folder_row.addWidget(self.next_folder_btn)
+        folder_row_w = QWidget()
+        folder_row_w.setLayout(folder_row)
+        controls_layout.addWidget(folder_row_w, 2, 0, 1, 3)
+
+        self.current_folder_project = QLabel("Folders: 0/0")
+        self.current_folder_project.setWordWrap(True)
+        self.current_folder_project.setStyleSheet(
+            "QLabel { color: #1b8f2e; font-weight: 600; }"
+        )
+        controls_layout.addWidget(self.current_folder_project, 3, 0, 1, 3)
 
         self.current_image_project = QLabel("Images: 0/0")
         self.current_image_project.setWordWrap(True)
         self.current_image_project.setStyleSheet("QLabel { color: #1b8f2e; font-weight: 600; }")
-        controls_layout.addWidget(self.current_image_project, 1, 0, 1, 3)
+        controls_layout.addWidget(self.current_image_project, 4, 0, 1, 3)
 
         # Settings
         settings = QGroupBox("Model settings")
@@ -1185,10 +1301,29 @@ class MainWindow(QMainWindow):
         self._apply_left_width(force=True)
         self._apply_tool_width(force=True)
 
-        self.setCentralWidget(root)
+        central_widget = QWidget()
+        cv = QVBoxLayout(central_widget)
+        cv.setContentsMargins(0, 0, 0, 0)
+        self._mode_stack = QStackedWidget()
+        self._mode_stack.addWidget(pose_root)
+        self._ar_page = ActionRecognitionPage(on_switch_pose=lambda: self._set_annotation_mode(0))
+        self._mode_stack.addWidget(self._ar_page)
+        cv.addWidget(self._mode_stack)
+        self.setCentralWidget(central_widget)
         self._update_buttons()
         self._update_current_image_labels()
         self._update_present_keypoints_list()
+
+    def _set_annotation_mode(self, idx: int) -> None:
+        """0 = Pose / keypoints, 1 = Action Recognition (bbox + class)."""
+        self._mode_stack.setCurrentIndex(int(idx))
+        pose = int(idx) == 0
+        if hasattr(self, "_shortcut_prev"):
+            self._shortcut_prev.setEnabled(pose)
+        if hasattr(self, "_shortcut_next"):
+            self._shortcut_next.setEnabled(pose)
+        if hasattr(self, "_shortcut_bbox_guide"):
+            self._shortcut_bbox_guide.setEnabled(pose)
 
     def _apply_left_width(self, force: bool = False) -> None:
         if not hasattr(self, "_splitter") or not hasattr(self, "_left_panel"):
@@ -1422,30 +1557,183 @@ class MainWindow(QMainWindow):
     def _show_error(self, title: str, message: str) -> None:
         QMessageBox.critical(self, title, message)
 
+    def _load_custom_keypoints_from_file(self) -> None:
+        """Load additional custom keypoints from data/custom_classes.txt into _kp_defs."""
+        path = _custom_classes_path()
+        if not path.exists():
+            return
+        try:
+            text = path.read_text(encoding="utf-8")
+        except Exception:
+            return
+
+        for raw in text.splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            # Accept formats like "7. Trachea" or "7 Trachea"
+            parts = line.replace("\t", " ").split(None, 1)
+            if not parts or not parts[0].rstrip(".").isdigit():
+                continue
+            slot = int(parts[0].rstrip("."))
+            if slot <= 0:
+                continue
+            name = parts[1].strip() if len(parts) > 1 else f"custom_{slot}"
+            self._kp_defs[slot] = KeypointDef(
+                slot=slot,
+                name=name,
+                source="custom",
+                yolo_slot=None,
+            )
+
     # --- Actions
-    def pick_images_dir(self) -> None:
-        folder = QFileDialog.getExistingDirectory(self, "Select images folder")
+    def pick_root_dir(self) -> None:
+        folder = QFileDialog.getExistingDirectory(self, "Select root directory")
         if not folder:
             return
-        images_dir = Path(folder)
+        root = Path(folder)
+        self.state.root_dir = root
+        self.images_dir_edit.setText(str(root))
+
+        # Collect direct child folders that contain at least one image.
+        recursive = bool(self.recursive_check.isChecked())
+        folders: list[Path] = []
+        try:
+            for p in sorted(root.iterdir()):
+                if not p.is_dir():
+                    continue
+                it = iter(iter_images(p, recursive=recursive))
+                try:
+                    next(it)
+                    folders.append(p)
+                except StopIteration:
+                    continue
+        except Exception:
+            folders = []
+
+        self.state.folders = folders
+        self.state.folder_index = 0
+        if not folders:
+            self.state.images_dir = None
+            self.state.images = []
+            self.state.index = 0
+            self.current_folder_project.setText("Folders: 0/0")
+            self.current_image_project.setText("Images: 0/0")
+            self.prev_folder_btn.setEnabled(False)
+            self.next_folder_btn.setEnabled(False)
+            self.annotate_btn.setEnabled(False)
+            self.predict_btn.setEnabled(False)
+            self.viewer.set_placeholder("No image folders found under this root.")
+            self.status.setText("No folders with images found.")
+            return
+
+        self._load_folder(folders[0])
+
+    def _load_folder(self, images_dir: Path) -> None:
+        """Load one images folder under the selected root and prepare UI."""
         self.state.images_dir = images_dir
-        self.images_dir_edit.setText(str(images_dir))
-        # Do not auto-annotate or auto-predict on selection; just list images.
         self.state.images = list(
             iter_images(images_dir, recursive=bool(self.recursive_check.isChecked()))
         )
         self.state.index = 0
-        self.status.setText(f"Found {len(self.state.images)} images.")
+
+        self._update_folder_labels()
         self._update_buttons()
         self._update_current_image_labels()
         self._update_present_keypoints_list()
+
         if (images_dir / "keypoints.txt").exists():
             self.annotate_btn.setEnabled(False)
-            self.status.setText("This folder is already labeled (keypoints.txt found). Auto-annotate disabled.")
+            self.status.setText(
+                "This folder is already labeled (keypoints.txt found). Auto-annotate disabled."
+            )
             self.viewer.set_placeholder("Click 'Predict / Preview' to view existing labels.")
         else:
-            self.annotate_btn.setEnabled(True)
+            self.annotate_btn.setEnabled(bool(self.state.images))
             self.viewer.set_placeholder("Click 'Predict / Preview' to visualize.")
+
+    def _update_folder_labels(self) -> None:
+        total = len(self.state.folders or [])
+        if total <= 0:
+            self.current_folder_project.setText("Folders: 0/0")
+            self.prev_folder_btn.setEnabled(False)
+            self.next_folder_btn.setEnabled(False)
+            return
+        i = int(self.state.folder_index) + 1
+        self.current_folder_project.setText(f"Folders: {i}/{total}")
+        self.prev_folder_btn.setEnabled(self.state.folder_index > 0)
+        self.next_folder_btn.setEnabled(self.state.folder_index < total - 1)
+
+    def prev_folder(self) -> None:
+        if not self.state.folders or self.state.folder_index <= 0:
+            return
+        if not self._maybe_autosave_current_before_navigation():
+            return
+        self.state.folder_index -= 1
+        self._load_folder(self.state.folders[self.state.folder_index])
+
+    def next_folder(self) -> None:
+        if not self.state.folders or self.state.folder_index >= len(self.state.folders) - 1:
+            return
+        if not self._maybe_autosave_current_before_navigation():
+            return
+        self._move_current_folder_to_done_if_annotated()
+        # After move, folder list may shrink (we remove current folder). Keep index pointing to next.
+        if not self.state.folders:
+            return
+        if self.state.folder_index >= len(self.state.folders) - 1:
+            # If we were at the end after removal, do nothing.
+            return
+        self.state.folder_index += 1
+        self._load_folder(self.state.folders[self.state.folder_index])
+
+    def _move_current_folder_to_done_if_annotated(self) -> None:
+        """If current folder contains keypoints.txt, move it to <root>/Annotation_Done/."""
+        if self.state.root_dir is None or self.state.images_dir is None:
+            return
+        cur = self.state.images_dir
+        if not (cur / "keypoints.txt").exists():
+            return
+
+        done_dir = self.state.root_dir / "Annotation_Done"
+        try:
+            done_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            # If we can't create the folder, just skip moving.
+            return
+
+        dest = done_dir / cur.name
+        # Avoid collisions: append _1, _2, ...
+        if dest.exists():
+            base = cur.name
+            k = 1
+            while True:
+                cand = done_dir / f"{base}_{k}"
+                if not cand.exists():
+                    dest = cand
+                    break
+                k += 1
+
+        try:
+            shutil.move(str(cur), str(dest))
+        except Exception:
+            self.status.setText("Could not move folder to Annotation_Done (files may be in use).")
+            return
+
+        # Remove moved folder from navigation list.
+        try:
+            if self.state.folders:
+                self.state.folders = [p for p in self.state.folders if p.resolve() != cur.resolve()]
+        except Exception:
+            pass
+
+        # Keep folder_index stable: we removed the current folder (at current index), so step back one slot.
+        if self.state.folder_index > 0:
+            self.state.folder_index -= 1
+        else:
+            self.state.folder_index = 0
+
+        self._update_folder_labels()
 
     def prev_image(self) -> None:
         if self.state.index > 0:
@@ -2339,6 +2627,34 @@ class MainWindow(QMainWindow):
 
         self.status.setText("Deleted keypoint. Click Save label to persist.")
         self._update_present_keypoints_list()
+
+    def change_keypoint_slot(self, person_idx: int, from_slot: int, to_slot: int) -> None:
+        """Move a keypoint from one output slot to another for a given person."""
+        if self._edit_kpts_xyv is None:
+            return
+        p = int(person_idx)
+        fs = int(from_slot)
+        ts = int(to_slot)
+        if fs == ts:
+            return
+        fi = fs - 1
+        ti = ts - 1
+        if not (0 <= p < self._edit_kpts_xyv.shape[0]):
+            return
+        if not (0 <= fi < self._edit_kpts_xyv.shape[1] and 0 <= ti < self._edit_kpts_xyv.shape[1]):
+            return
+
+        # Only move if source exists
+        src = self._edit_kpts_xyv[p, fi].copy()
+        if float(src[2]) <= 0:
+            return
+
+        self._edit_kpts_xyv[p, ti] = src
+        self._edit_kpts_xyv[p, fi] = 0.0
+
+        self._render_editable_overlay(fit=False)
+        self._update_present_keypoints_list()
+        self.status.setText(f"Changed keypoint {fs} → {ts}. Click Save label to persist.")
 
     def delete_selected_bboxes(self) -> bool:
         """Delete selected bbox(es) (keep keypoints). Returns True if any bbox was deleted."""
