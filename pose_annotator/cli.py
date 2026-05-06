@@ -13,7 +13,7 @@ from pose_annotator.auto_annotate import infer_labels_dir, iter_images, run_auto
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        prog="pose-annotator",
+        prog="cus-keypoints",
         description=(
             "Auto-annotate images with Ultralytics YOLO pose models. "
             "Writes one .txt per image in YOLO pose format (see Ultralytics dataset docs)."

@@ -17,8 +17,12 @@ from PySide6.QtGui import (
     QPen,
     QPixmap,
     QShortcut,
+    QShowEvent,
 )
 from PySide6.QtWidgets import (
+    QCheckBox,
+    QDialog,
+    QDialogButtonBox,
     QGraphicsPixmapItem,
     QGraphicsRectItem,
     QGraphicsScene,
@@ -30,6 +34,7 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QGridLayout,
     QListWidget,
+    QMenu,
     QMessageBox,
     QPushButton,
     QSizePolicy,
@@ -41,12 +46,13 @@ from PySide6.QtWidgets import (
 from pose_annotator.auto_annotate import IMAGE_EXTS
 
 
-def _package_root() -> Path:
-    return Path(__file__).resolve().parent.parent
+def _annotator_package_dir() -> Path:
+    """Directory containing pose_annotator modules (works from PyPI install or checkout)."""
+    return Path(__file__).resolve().parent
 
 
 def _ar_classes_path() -> Path:
-    return _package_root() / "data" / "ar_classes.txt"
+    return _annotator_package_dir() / "data" / "ar_classes.txt"
 
 
 def _to_qpixmap(rgb: np.ndarray) -> QPixmap:
@@ -73,11 +79,13 @@ class ARRectItem(QGraphicsRectItem):
         cls_name: str,
         on_changed,
         on_request_delete,
+        page: "ActionRecognitionPage",
     ) -> None:
         super().__init__(rect)
         self.cls_id = int(cls_id)
         self._on_changed = on_changed
         self._on_request_delete = on_request_delete
+        self._page = page
         self.setPen(QPen(QColor(0, 180, 255), 2))
         self.setBrush(QBrush(QColor(0, 160, 255, 40)))
         self.setFlag(QGraphicsRectItem.GraphicsItemFlag.ItemIsSelectable, True)
@@ -100,12 +108,24 @@ class ARRectItem(QGraphicsRectItem):
         return super().itemChange(change, value)
 
     def contextMenuEvent(self, event) -> None:  # type: ignore[override]
-        from PySide6.QtWidgets import QMenu
-
         menu = QMenu()
+        names = self._page._class_names_ordered()
+        sub = menu.addMenu("Set class")
+        for cid, nm in enumerate(names):
+            act = sub.addAction(f"{cid}: {nm}")
+            act.setData(cid)
+        menu.addSeparator()
         act_del = menu.addAction("Delete box")
         chosen = menu.exec(event.screenPos())
-        if chosen == act_del:
+        if chosen is None:
+            event.accept()
+            return
+        data = chosen.data()
+        if data is not None:
+            self._page.set_rect_class(self, int(data))
+            event.accept()
+            return
+        if chosen is act_del:
             self._on_request_delete(self)
             event.accept()
             return
@@ -280,6 +300,8 @@ class ActionRecognitionPage(QWidget):
         self._index = 0
         self._im_wh: tuple[int, int] = (0, 0)
         self._items: list[ARRectItem] = []
+        # Normalized xyxy on last image before Prev/Next — used by Ctrl+V paste.
+        self._bbox_clipboard_ar: Optional[tuple[float, float, float, float]] = None
 
         root = QHBoxLayout(self)
         root.setContentsMargins(8, 8, 8, 8)
@@ -315,10 +337,16 @@ class ActionRecognitionPage(QWidget):
         self.class_list = QListWidget()
         self.class_list.setMinimumHeight(180)
         cv.addWidget(self.class_list)
+        cls_hint = QLabel(
+            "Escape: clear selection. No selection → draw or Ctrl+V asks for class. "
+            "Paste uses sidebar class when one is selected."
+        )
+        cls_hint.setWordWrap(True)
+        cls_hint.setStyleSheet("color: #666; font-size: 11px;")
+        cv.addWidget(cls_hint)
 
         lv.addWidget(proj)
-        lv.addWidget(classes_box)
-        lv.addStretch(1)
+        lv.addWidget(classes_box, stretch=1)
 
         # Right
         right = QWidget()
@@ -354,8 +382,14 @@ class ActionRecognitionPage(QWidget):
         row.addWidget(self.btn_save)
         tl.addLayout(row)
         tl.addWidget(self.btn_draw)
+        self.chk_autosave = QCheckBox("Autosave when switching image")
+        self.chk_autosave.setToolTip(
+            "Save annotations for the current image before Previous / Next (and A / D)."
+        )
+        tl.addWidget(self.chk_autosave)
         hint = QLabel(
-            "Hotkeys (focus preview): W toggle draw box • A/D prev/next • Del delete • Ctrl+S save • Wheel zoom • Middle-drag pan"
+            "Hotkeys (focus preview): W toggle draw box • A/D prev/next • Del delete • Ctrl+S save • Ctrl+V paste bbox "
+            "(cached on Prev/Next) • Wheel zoom • Middle-drag pan"
         )
         hint.setWordWrap(True)
         hint.setStyleSheet("QLabel { color: #666; font-size: 11px; }")
@@ -366,8 +400,7 @@ class ActionRecognitionPage(QWidget):
         rs.addWidget(tools)
         rs.setStretchFactor(0, 19)
         rs.setStretchFactor(1, 1)
-        tool_panel = tools
-        tool_panel.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
+        tools.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
 
         rv.addWidget(rs)
 
@@ -376,10 +409,25 @@ class ActionRecognitionPage(QWidget):
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 9)
 
+        self._ar_main_splitter = splitter
+        self._ar_left_panel = left
+        self._ar_right_panel = right
+        self._ar_right_split = rs
+        self._ar_tool_panel = tools
+        self._left_min_px = 320
+        self._tool_min_px = 180
+        self._apply_ar_left_width(force=True)
+        self._apply_ar_tool_width(force=True)
+
         root.addWidget(splitter)
 
         self._ensure_classes_file()
         self._load_class_list()
+        self.class_list.setCurrentRow(-1)
+
+        esc_clear = QShortcut(QKeySequence("Escape"), self.class_list)
+        esc_clear.setContext(Qt.ShortcutContext.WidgetShortcut)
+        esc_clear.activated.connect(lambda: self.class_list.setCurrentRow(-1))
 
         # Shortcuts on viewer
         QShortcut(QKeySequence("W"), self.viewer, context=Qt.ShortcutContext.WidgetShortcut).activated.connect(
@@ -397,6 +445,40 @@ class ActionRecognitionPage(QWidget):
         QShortcut(QKeySequence.StandardKey.Delete, self.viewer, context=Qt.ShortcutContext.WidgetShortcut).activated.connect(
             self.delete_selected
         )
+        QShortcut(QKeySequence.StandardKey.Paste, self.viewer, context=Qt.ShortcutContext.WidgetShortcut).activated.connect(
+            self.paste_ar_bbox
+        )
+
+    def resizeEvent(self, event) -> None:  # type: ignore[override]
+        super().resizeEvent(event)
+        self._apply_ar_left_width(force=False)
+        self._apply_ar_tool_width(force=False)
+
+    def showEvent(self, event: QShowEvent) -> None:  # type: ignore[override]
+        super().showEvent(event)
+        self._apply_ar_left_width(force=True)
+        self._apply_ar_tool_width(force=True)
+
+    def _apply_ar_left_width(self, force: bool = False) -> None:
+        if not hasattr(self, "_ar_main_splitter") or not hasattr(self, "_ar_left_panel"):
+            return
+        w = max(self._left_min_px, int(self.width() * 0.10))
+        self._ar_left_panel.setMinimumWidth(w)
+        self._ar_left_panel.setMaximumWidth(w)
+        if force:
+            total = max(1, self.width())
+            self._ar_main_splitter.setSizes([w, max(1, total - w)])
+
+    def _apply_ar_tool_width(self, force: bool = False) -> None:
+        if not hasattr(self, "_ar_right_split") or not hasattr(self, "_ar_tool_panel"):
+            return
+        rp_w = self._ar_right_panel.width() if self._ar_right_panel.width() > 0 else self.width()
+        w = max(self._tool_min_px, int(rp_w * 0.05))
+        self._ar_tool_panel.setMinimumWidth(w)
+        self._ar_tool_panel.setMaximumWidth(w)
+        if force:
+            total = max(1, rp_w)
+            self._ar_right_split.setSizes([max(1, total - w), w])
 
     def _ensure_classes_file(self) -> None:
         p = _ar_classes_path()
@@ -424,14 +506,102 @@ class ActionRecognitionPage(QWidget):
         if self.class_list.count() == 0:
             self.class_list.addItem("object")
 
-    def selected_class_id(self) -> tuple[int, str]:
+    def active_class_selection(self) -> Optional[tuple[int, str]]:
+        """Sidebar class used for new boxes / paste when a row is selected."""
         row = self.class_list.currentRow()
+        if row < 0 or self.class_list.count() == 0:
+            return None
+        return row, self.class_list.item(row).text()
+
+    def _pick_class_for_bbox(self) -> Optional[tuple[int, str]]:
+        names = self._class_names_ordered()
+        if not names:
+            QMessageBox.warning(self, "Classes", "No classes defined.")
+            return None
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Class for box")
+        vl = QVBoxLayout(dlg)
+        lw = QListWidget()
+        for i, nm in enumerate(names):
+            lw.addItem(f"{i}: {nm}")
+        if lw.count() > 0:
+            lw.setCurrentRow(0)
+        vl.addWidget(lw)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        vl.addWidget(buttons)
+
+        def accept_row(_item) -> None:
+            dlg.accept()
+
+        lw.itemDoubleClicked.connect(accept_row)
+
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return None
+        row = lw.currentRow()
         if row < 0:
-            row = 0
-            if self.class_list.count() > 0:
-                self.class_list.setCurrentRow(0)
-        name = self.class_list.item(row).text() if self.class_list.count() else "object"
-        return row, name
+            return None
+        return row, names[row]
+
+    def _class_for_new_box(self) -> Optional[tuple[int, str]]:
+        sel = self.active_class_selection()
+        if sel is not None:
+            return sel
+        return self._pick_class_for_bbox()
+
+    def _capture_ar_bbox_clipboard(self) -> None:
+        """Store last bbox geometry (normalized xyxy) from the image we are leaving."""
+        self._bbox_clipboard_ar = None
+        W, H = self._im_wh
+        if W <= 0 or H <= 0 or not self._items:
+            return
+        item: Optional[ARRectItem] = None
+        sc = self.viewer.scene()
+        if sc is not None:
+            for it in sc.selectedItems():
+                if isinstance(it, ARRectItem):
+                    item = it
+                    break
+        if item is None:
+            item = self._items[-1]
+        r = item.rect()
+        pos = item.pos()
+        x1 = (r.left() + pos.x()) / float(W)
+        y1 = (r.top() + pos.y()) / float(H)
+        x2 = (r.right() + pos.x()) / float(W)
+        y2 = (r.bottom() + pos.y()) / float(H)
+        self._bbox_clipboard_ar = (x1, y1, x2, y2)
+
+    def paste_ar_bbox(self) -> None:
+        """Paste bbox geometry from last Prev/Next; class from sidebar if selected, else dialog."""
+        if self._bbox_clipboard_ar is None:
+            QMessageBox.information(
+                self,
+                "Paste bbox",
+                "No bbox cached yet. Add at least one box on this image, then use "
+                "Previous or Next to cache its geometry for Ctrl+V.",
+            )
+            return
+        if not self._images:
+            return
+        W, H = self._im_wh
+        if W <= 0 or H <= 0:
+            return
+        picked = self._class_for_new_box()
+        if picked is None:
+            return
+        cid, nm = picked
+        x1, y1, x2, y2 = self._bbox_clipboard_ar
+        rect = QRectF(
+            QPointF(x1 * float(W), y1 * float(H)), QPointF(x2 * float(W), y2 * float(H))
+        ).normalized()
+        if rect.width() < 4 or rect.height() < 4:
+            QMessageBox.warning(self, "Paste bbox", "Cached bbox is too small.")
+            return
+        self._add_item(cid, nm, rect)
 
     def _open_dir(self) -> None:
         d = QFileDialog.getExistingDirectory(self, "Open image directory")
@@ -444,6 +614,7 @@ class ActionRecognitionPage(QWidget):
         self._images_dir = folder
         self._images = imgs
         self._index = 0
+        self._bbox_clipboard_ar = None
         self.dir_label.setText(str(folder))
         self.lbl_counts.setText(f"Images: {len(imgs)} total")
         self._update_nav()
@@ -510,34 +681,53 @@ class ActionRecognitionPage(QWidget):
             out.append(self.class_list.item(i).text())
         return out if out else ["object"]
 
+    def _remove_rect_item(self, item: ARRectItem) -> None:
+        sc = self.viewer.scene()
+        if sc is None:
+            return
+        try:
+            sc.removeItem(item._label)
+        except Exception:
+            pass
+        try:
+            sc.removeItem(item)
+        except Exception:
+            pass
+        if item in self._items:
+            self._items.remove(item)
+
+    def set_rect_class(self, item: ARRectItem, cls_id: int) -> None:
+        names = self._class_names_ordered()
+        nm = names[cls_id] if 0 <= cls_id < len(names) else str(cls_id)
+        item.set_class(cls_id, nm)
+        if 0 <= cls_id < self.class_list.count():
+            self.class_list.setCurrentRow(cls_id)
+
     def _add_item(self, cls_id: int, cls_name: str, rect: QRectF) -> ARRectItem:
         def _chg(it: ARRectItem) -> None:
             pass
 
         def _del(it: ARRectItem) -> None:
-            try:
-                self.viewer.scene().removeItem(it._label)
-            except Exception:
-                pass
-            try:
-                self.viewer.scene().removeItem(it)
-            except Exception:
-                pass
-            if it in self._items:
-                self._items.remove(it)
+            self._remove_rect_item(it)
 
-        item = ARRectItem(rect, cls_id, cls_name, _chg, _del)
+        item = ARRectItem(rect, cls_id, cls_name, _chg, _del, self)
         self.viewer.add_rect_item(item)
         self._items.append(item)
         return item
 
     def on_box_drawn(self, rect: QRectF) -> None:
-        cid, nm = self.selected_class_id()
+        picked = self._class_for_new_box()
+        if picked is None:
+            return
+        cid, nm = picked
         self._add_item(cid, nm, rect)
 
     def prev_image(self) -> None:
         if self._index <= 0:
             return
+        if self.chk_autosave.isChecked():
+            self.save_current()
+        self._capture_ar_bbox_clipboard()
         self._index -= 1
         self._update_nav()
         self.load_current_image()
@@ -545,6 +735,9 @@ class ActionRecognitionPage(QWidget):
     def next_image(self) -> None:
         if self._index >= len(self._images) - 1:
             return
+        if self.chk_autosave.isChecked():
+            self.save_current()
+        self._capture_ar_bbox_clipboard()
         self._index += 1
         self._update_nav()
         self.load_current_image()
@@ -555,13 +748,7 @@ class ActionRecognitionPage(QWidget):
             return
         for it in list(sc.selectedItems()):
             if isinstance(it, ARRectItem):
-                try:
-                    sc.removeItem(it._label)
-                except Exception:
-                    pass
-                sc.removeItem(it)
-                if it in self._items:
-                    self._items.remove(it)
+                self._remove_rect_item(it)
 
     def save_current(self) -> None:
         if not self._images:

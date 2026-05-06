@@ -1,23 +1,54 @@
 [build-system]
-requires = ["setuptools>=61.0"]
+requires = ["setuptools>=77.0.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "pose-annotator"
-version = "0.1.0"
-description = "YOLO pose auto-annotation for Ultralytics training format"
+name = "cus-keypoints"
+dynamic = ["version"]
+description = "Desktop GUI and CLI for YOLO pose/keypoint datasets (Ultralytics) and bbox + class labels."
+readme = "README.md"
 requires-python = ">=3.9"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{name = "Keypoints Studio contributors"}]
+keywords = [
+    "yolo",
+    "pose",
+    "keypoints",
+    "annotation",
+    "ultralytics",
+    "pyside6",
+    "labelimg",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: X11 Applications :: Qt",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = [
     "ultralytics>=8.3.0",
     "tqdm>=4.66.0",
     "numpy>=1.24.0",
     "pyside6>=6.7.0",
+    "opencv-python-headless>=4.8.0",
 ]
 
 [project.scripts]
-pose-annotator = "pose_annotator.cli:main"
-pose-annotator-gui = "pose_annotator.gui:main"
+cus-keypoints = "pose_annotator.cli:main"
+cus-keypoints-gui = "pose_annotator.gui:main"
 
-[tool.setuptools.packages.find]
-where = ["."]
-include = ["pose_annotator*"]
+[tool.setuptools]
+packages = ["pose_annotator", "pose_annotator.data"]
+
+[tool.setuptools.package-data]
+pose_annotator = ["data/*.txt"]
+
+[tool.setuptools.dynamic]
+version = {attr = "pose_annotator.__version__"}

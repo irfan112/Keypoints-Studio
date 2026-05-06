@@ -16,8 +16,8 @@
 ## Quick start
 
 1. Create conda env and install PyTorch (GPU optional) — see [Install](#install).
-2. Install this repo: `python -m pip install -e .`
-3. Launch: `pose-annotator-gui`
+2. Install from PyPI: `python -m pip install cus-keypoints` — or from source: `python -m pip install -e .`
+3. Launch: `cus-keypoints-gui`
 4. **Pose workflow:** pick a **root directory** → app lists **subfolders that contain images** → use **Next folder** / **Previous folder** → **Predict / Preview** or **Auto-annotate folder** → edit → **Save label**.
 5. **AR workflow:** **Switch AR** → **Open Dir…** → select class → **Create Box (W)** and drag → **Save**.
 
@@ -73,7 +73,15 @@ python -c "import torch; print('torch', torch.__version__); print('cuda', torch.
 
 ### 3. Install Keypoints Studio
 
-From the project root (folder that contains `pyproject.toml`):
+**PyPI (recommended once published):**
+
+```bat
+conda activate torch_gpu
+python -m pip install -U pip
+python -m pip install cus-keypoints
+```
+
+**Editable install from a git clone** (folder that contains `pyproject.toml`):
 
 ```bat
 conda activate torch_gpu
@@ -88,8 +96,10 @@ python -m pip install -e .
 
 ```bat
 conda activate torch_gpu
-pose-annotator-gui
+cus-keypoints-gui
 ```
+
+Console command names are **`cus-keypoints`** (CLI) and **`cus-keypoints-gui`** (GUI). The Python package you import is still **`pose_annotator`**.
 
 ---
 
@@ -136,7 +146,9 @@ If a folder contains **`keypoints.txt`**:
 
 | File | Role |
 |------|------|
-| `data/custom_classes.txt` | Optional extra **custom keypoint slots** (`7. Trachea`). Loaded at startup; merged into the mapping preview (header shown in red). |
+| `pose_annotator/data/custom_classes.txt` | Optional extra **custom keypoint slots** (`7. Trachea`). Shipped with the package (under `site-packages/.../pose_annotator/data/` after `pip install`). Loaded at startup; merged into the mapping preview (header shown in red). |
+
+The repository root `data/` folder is only a convenience copy for browsing on GitHub — the running app reads **`pose_annotator/data/`**.
 
 ### Keypoint mapping
 
@@ -151,7 +163,7 @@ Inspired by workflows like [labelImg](https://github.com/HumanSignal/labelImg): 
 | Item | Detail |
 |------|--------|
 | Enter / exit | **Switch AR** (Pose screen) / **Switch Pose** (AR screen) |
-| Classes | `data/ar_classes.txt` — **one class per line**; class **ID = line index starting at 0** |
+| Classes | `pose_annotator/data/ar_classes.txt` — **one class per line**; class **ID = line index starting at 0** |
 | Labels | One `<image>.txt` per image: `class_id x_center y_center width height` (normalized 0–1) |
 | Also writes | `classes.txt` in that image folder (class names) |
 | Useful keys | **W** toggle draw box, **A** / **D** prev/next image, **Ctrl+S** save, **Del** delete selected box |
@@ -187,7 +199,7 @@ class_id x_center y_center width height
 
 ```bat
 conda activate torch_gpu
-pose-annotator "C:\path\to\images" --device 0 -v
+cus-keypoints "C:\path\to\images" --device 0 -v
 ```
 
 - **`--device cpu`** forces CPU.
@@ -207,7 +219,7 @@ Reinstall CUDA builds from conda (see [Install](#install)), or use **`cpu`** in 
 
 ### `WinError 32` when reinstalling (executable locked)
 
-Close **pose-annotator-gui**, then:
+Close **cus-keypoints-gui**, then:
 
 ```bat
 python -m pip install -e .
@@ -219,6 +231,23 @@ Do **not** commit model weights. Keep them local and use `.gitignore` patterns s
 
 ---
 
+## Maintainer: publish to PyPI
+
+Distribution name on PyPI: **`cus-keypoints`** (the unrelated PyPI project **`pose-annotator`** is a different tool).
+
+1. Bump **`__version__`** in `pose_annotator/__init__.py`.
+2. Build and upload:
+
+```bat
+python -m pip install -U build twine
+python -m build
+python -m twine upload dist/*
+```
+
+Use a [PyPI API token](https://pypi.org/help/#apitoken) as the password. Prefer [trusted publishing](https://docs.pypi.org/trusted-publishers/) from GitHub Actions if you use CI.
+
+---
+
 ## License
 
-See project `LICENSE` if present; otherwise follow your repository’s chosen license.
+Released under the MIT License — see [`LICENSE`](LICENSE).

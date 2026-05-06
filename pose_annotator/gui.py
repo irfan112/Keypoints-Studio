@@ -646,9 +646,9 @@ def _default_keypoint_defs() -> dict[int, KeypointDef]:
 
 
 def _custom_classes_path() -> Path:
-    """Return path to data/custom_classes.txt (if present)."""
+    """Return path to packaged custom_classes.txt (aside pose_annotator package)."""
     here = Path(__file__).resolve()
-    return here.parent.parent / "data" / "custom_classes.txt"
+    return here.parent / "data" / "custom_classes.txt"
 
 
 def _defs_to_text(defs: dict[int, KeypointDef]) -> str:

@@ -1,0 +1,10 @@
+# One custom keypoint per line: "<slot>. <name>"
+# Lines starting with # are ignored.
+#
+# Example:
+7. Trachea
+9. Forehead
+12. Sacrum
+17. Right_FootIndex
+18. Left_FootIndex
+
