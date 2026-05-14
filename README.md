@@ -131,8 +131,9 @@ If the **current folder** already contains **`keypoints.txt`** (treated as finis
 | Save current frame | **Save label** |
 | Auto-save on image change | Enable **Auto save**, then use **Next** / **Previous** or **A** / **D** |
 | Paste bbox from **previous** image only | Focus preview, **Ctrl+V** — replaces bbox for selected **Person**; keypoints unchanged |
-| Paste keypoints from **previous** image only | Focus preview, **Ctrl+B** — overwrites keypoints for selected **Person** |
+| Paste keypoints from **previous** frame | Focus preview, **Ctrl+B** — pastes **all** copied persons onto **Person** *N*, *N+1*, … (set **Person** to the first target). Cached when you **Prev/Next** image. |
 | Crosshair + draw new bbox | **W** — crosshair; drag left button; middle-drag pans |
+| **Add keypoint** | Toggle **Add keypoint**, pick **KP#**, then click: the person is **whichever bbox contains the click** (if several overlap, nearest box center). Clicks **outside** all boxes use **Person** spinbox. |
 | Delete keypoint / bbox | Select item, **Delete**, or right-click menu |
 
 ### Labeled folder behavior

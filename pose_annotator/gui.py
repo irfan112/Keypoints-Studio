@@ -990,7 +990,8 @@ class MainWindow(QMainWindow):
         self._autosave_enabled = False
         # Last bbox (xyxy normalized to source image) + class when navigating away — Ctrl+V only replaces bbox.
         self._bbox_clipboard: Optional[tuple[np.ndarray, np.ndarray]] = None
-        # Last person's keypoints (normalized x,y in [0,1]) when navigating away — Ctrl+B paste.
+        # All persons' keypoints (normalized x,y in [0,1]), shape (N, K, 3), when navigating away — Ctrl+B paste.
+        # Legacy clipboard may be (K, 3) for a single person.
         self._kpts_clipboard: Optional[np.ndarray] = None
         self._overlay_rects: list[QGraphicsRectItem] = []
         self._overlay_kps: list[DraggableKeypoint] = []
@@ -1213,6 +1214,12 @@ class MainWindow(QMainWindow):
         self.add_person_spin = QSpinBox()
         self.add_person_spin.setRange(1, 1)
         self.add_person_spin.setValue(1)
+        self.add_person_spin.setToolTip(
+            "Target person when the click is not inside any bbox.\n"
+            "In Add keypoint mode, the person is chosen automatically from which "
+            "bounding box contains the click (nearest box center if boxes overlap).\n"
+            "Ctrl+B paste still uses this value as the first person index."
+        )
 
         tool_panel = QGroupBox("Tools")
         tool_layout = QVBoxLayout(tool_panel)
@@ -1772,19 +1779,6 @@ class MainWindow(QMainWindow):
                 return i
         return None
 
-    def _last_keypoints_source_person_index(self) -> Optional[int]:
-        """Person row to copy keypoints from: prefer last visible bbox; else last row with any kp."""
-        i = self._last_bbox_person_index()
-        if i is not None:
-            return i
-        if self._edit_kpts_xyv is None or self._edit_kpts_xyv.shape[0] == 0:
-            return None
-        n = int(self._edit_kpts_xyv.shape[0])
-        for j in range(n - 1, -1, -1):
-            if np.any(self._edit_kpts_xyv[j, :, 2] > 0):
-                return j
-        return None
-
     def _read_image_wh(self, image_path: Path) -> Optional[tuple[int, int]]:
         try:
             import cv2  # type: ignore
@@ -1829,13 +1823,9 @@ class MainWindow(QMainWindow):
         )
 
     def _capture_kpts_clipboard_from_current_image(self) -> None:
-        """Remember keypoints for the source person as normalized x,y (matches bbox source when possible)."""
+        """Remember keypoints for every visible person (normalized xy), in person order — Ctrl+B paste."""
+        self._kpts_clipboard = None
         if self._edit_kpts_xyv is None or not self.state.images:
-            self._kpts_clipboard = None
-            return
-        idx = self._last_keypoints_source_person_index()
-        if idx is None:
-            self._kpts_clipboard = None
             return
         wh = self._read_image_wh(self._current_image())
         if wh is None:
@@ -1845,10 +1835,23 @@ class MainWindow(QMainWindow):
         if w <= 0 or h <= 0:
             self._kpts_clipboard = None
             return
-        row = self._edit_kpts_xyv[idx].astype(np.float64).copy()
-        row[:, 0] /= float(w)
-        row[:, 1] /= float(h)
-        self._kpts_clipboard = row
+        n = int(self._edit_kpts_xyv.shape[0])
+        del_m = (
+            self._det_deleted
+            if self._det_deleted is not None
+            else np.zeros((n,), dtype=bool)
+        )
+        rows: list[np.ndarray] = []
+        for j in range(n):
+            if bool(del_m[j]):
+                continue
+            row = self._edit_kpts_xyv[j].astype(np.float64).copy()
+            row[:, 0] /= float(w)
+            row[:, 1] /= float(h)
+            rows.append(row)
+        if not rows:
+            return
+        self._kpts_clipboard = np.stack(rows, axis=0)
 
     def paste_clipboard_bbox(self) -> None:
         """Paste bbox only from previous image (Ctrl+V). Replaces bbox + class for selected Person; keypoints unchanged."""
@@ -1909,7 +1912,7 @@ class MainWindow(QMainWindow):
         self._update_present_keypoints_list()
 
     def paste_clipboard_keypoints(self) -> None:
-        """Paste keypoints from previous image onto selected Person (Ctrl+B). Coords rescale to current image size."""
+        """Paste keypoints from previous image (Ctrl+B). Fills Person N, N+1, … from clipboard (multi-person)."""
         if not self.state.images:
             return
         if self._kpts_clipboard is None:
@@ -1927,8 +1930,18 @@ class MainWindow(QMainWindow):
             )
             return
 
-        person_idx = int(self.add_person_spin.value()) - 1
-        if person_idx < 0 or person_idx >= self._edit_kpts_xyv.shape[0]:
+        clip = self._kpts_clipboard
+        if clip.ndim == 2:
+            clip_rows = clip[np.newaxis, :, :].astype(np.float64)
+        elif clip.ndim == 3:
+            clip_rows = clip.astype(np.float64)
+        else:
+            self.status.setText("Keypoint clipboard has an unexpected shape; use Prev/Next to refresh it.")
+            return
+
+        person_start = int(self.add_person_spin.value()) - 1
+        n = int(self._edit_kpts_xyv.shape[0])
+        if person_start < 0 or person_start >= n:
             self.status.setText("Invalid Person # for keypoint paste.")
             return
 
@@ -1939,22 +1952,43 @@ class MainWindow(QMainWindow):
         w, h = wh[0], wh[1]
 
         out_k = int(self._edit_kpts_xyv.shape[1])
-        src_k = int(self._kpts_clipboard.shape[0])
-        k_use = min(out_k, src_k)
+        m_clip = int(clip_rows.shape[0])
+        k_src = int(clip_rows.shape[1])
+        k_use = min(out_k, k_src)
 
-        restored = np.zeros((out_k, 3), dtype=np.float64)
-        if k_use > 0:
-            chunk = self._kpts_clipboard[:k_use].astype(np.float64).copy()
-            chunk[:, 0] *= float(w)
-            chunk[:, 1] *= float(h)
-            restored[:k_use, :] = chunk
+        pasted = 0
+        for j in range(m_clip):
+            dst = person_start + j
+            if dst >= n:
+                break
+            restored = np.zeros((out_k, 3), dtype=np.float64)
+            if k_use > 0:
+                chunk = clip_rows[j, :k_use, :].copy()
+                chunk[:, 0] *= float(w)
+                chunk[:, 1] *= float(h)
+                restored[:k_use, :] = chunk
+            self._edit_kpts_xyv[dst, :, :] = restored
+            pasted += 1
 
-        self._edit_kpts_xyv[person_idx, :, :] = restored
         self._render_editable_overlay(fit=False)
         self._update_present_keypoints_list()
-        self.status.setText(
-            f"Pasted keypoints from previous image onto Person {person_idx + 1} (Ctrl+B)."
-        )
+        if pasted == 0:
+            self.status.setText("No keypoints pasted (no matching destination persons).")
+            return
+        last_p = person_start + pasted
+        if m_clip > pasted:
+            self.status.setText(
+                f"Pasted keypoints for {pasted} person(s) (Person {person_start + 1}–{last_p}). "
+                f"{m_clip - pasted} not applied — add more people (bboxes) on this frame or choose a lower Person #."
+            )
+        elif pasted == 1:
+            self.status.setText(
+                f"Pasted keypoints from previous image onto Person {person_start + 1} (Ctrl+B)."
+            )
+        else:
+            self.status.setText(
+                f"Pasted keypoints for {pasted} persons (Person {person_start + 1}–{last_p}) from previous image (Ctrl+B)."
+            )
 
     def _on_autosave_toggled(self, checked: bool) -> None:
         self._autosave_enabled = bool(checked)
@@ -2307,7 +2341,10 @@ class MainWindow(QMainWindow):
             self.viewer.setDragMode(QGraphicsView.DragMode.NoDrag)
             self.viewer.setCursor(Qt.CursorShape.CrossCursor)
             self.viewer.set_click_handler(self._on_add_click)
-            self.status.setText("Add mode: click on image to place selected keypoint.")
+            self.status.setText(
+                "Add mode: click inside a person's box to place the keypoint on that person "
+                "(overlaps → nearest box center). Outside all boxes, Person # is used."
+            )
         else:
             self.viewer.set_click_handler(None)
             if getattr(self, "_bbox_guide_mode", False):
@@ -2394,8 +2431,38 @@ class MainWindow(QMainWindow):
             f"Added bbox ({self._edit_xyxy.shape[0]} total). Drag corners to adjust. Press W to exit guide."
         )
 
+    def _person_index_for_scene_point(self, sx: float, sy: float) -> Optional[int]:
+        """Person whose non-deleted bbox contains (sx, sy); if several, pick nearest box center."""
+        if self._edit_xyxy is None:
+            return None
+        n = int(self._edit_xyxy.shape[0])
+        del_m = (
+            self._det_deleted
+            if self._det_deleted is not None
+            else np.zeros((n,), dtype=bool)
+        )
+        best_i: Optional[int] = None
+        best_d: Optional[float] = None
+        for i in range(n):
+            if bool(del_m[i]):
+                continue
+            x1, y1, x2, y2 = self._edit_xyxy[i].tolist()
+            if x1 > x2:
+                x1, x2 = x2, x1
+            if y1 > y2:
+                y1, y2 = y2, y1
+            if not (x1 <= sx <= x2 and y1 <= sy <= y2):
+                continue
+            cx = (x1 + x2) * 0.5
+            cy = (y1 + y2) * 0.5
+            d = (sx - cx) ** 2 + (sy - cy) ** 2
+            if best_d is None or d < best_d:
+                best_d = d
+                best_i = i
+        return best_i
+
     def _on_add_click(self, sx: float, sy: float) -> None:
-        """Place/move a keypoint for the selected person."""
+        """Place/move a keypoint for the person under the click (bbox hit-test), else Person spinbox."""
         if self._edit_kpts_xyv is None:
             return
         out_slot = int(self.add_slot_spin.value())
@@ -2413,7 +2480,14 @@ class MainWindow(QMainWindow):
                 "Invalid keypoint", f"Output keypoint {out_slot} is out of range."
             )
             return
-        person_idx = int(self.add_person_spin.value()) - 1
+
+        hit = self._person_index_for_scene_point(float(sx), float(sy))
+        if hit is not None:
+            person_idx = int(hit)
+            self.add_person_spin.setValue(person_idx + 1)
+        else:
+            person_idx = int(self.add_person_spin.value()) - 1
+
         if person_idx < 0 or person_idx >= self._edit_kpts_xyv.shape[0]:
             return
 
@@ -2427,6 +2501,10 @@ class MainWindow(QMainWindow):
         # To keep it fast and stable, we simply call Predict/Preview renderer without refit:
         self._render_editable_overlay(fit=False)
         self._update_present_keypoints_list()
+        src = "click → bbox" if hit is not None else "Person spinbox"
+        self.status.setText(
+            f"Set keypoint {out_slot} on Person {person_idx + 1} ({src}). Save label to persist."
+        )
 
     def annotate_folder(self) -> None:
         if self.state.images_dir is None or not self.state.images:
