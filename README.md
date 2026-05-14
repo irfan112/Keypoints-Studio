@@ -13,6 +13,148 @@
 
 ---
 
+## System map (grand chart)
+
+Use this section as a **single-page mental model** of the app. (GitHub renders the diagrams below; if you read this elsewhere, use a Mermaid-capable viewer.)
+
+### 1. Big picture — how you run it and what it talks to
+
+```mermaid
+flowchart TB
+  subgraph run [How you start]
+    PIP["pip install cus-keypoints"]
+    G["cus-keypoints-gui → desktop window"]
+    C["cus-keypoints CLI: images folder + flags"]
+  end
+
+  subgraph pkg [Python package pose_annotator]
+    GUI_MOD["gui.py — MainWindow + Pose UI"]
+    AR_MOD["ar_page.py — Action Recognition page"]
+    AA_MOD["auto_annotate.py — folder batch predict"]
+    FMT["formats.py — YOLO line helpers"]
+  end
+
+  subgraph external [Outside the app]
+    PT["Ultralytics YOLO .pt weights"]
+    IMG["Image files on disk"]
+  end
+
+  PIP --> G
+  PIP --> C
+  G --> GUI_MOD
+  GUI_MOD --> AR_MOD
+  C --> AA_MOD
+  GUI_MOD --> AA_MOD
+  GUI_MOD --> FMT
+  AR_MOD --> IMG
+  GUI_MOD --> IMG
+  AA_MOD --> IMG
+  GUI_MOD --> PT
+  AA_MOD --> PT
+```
+
+### 2. Desktop GUI — two modes in one window
+
+```mermaid
+flowchart LR
+  subgraph window [Keypoints Studio window]
+    STACK["QStackedWidget — one visible page"]
+    STACK --> POSE["Pose mode DEFAULT"]
+    STACK --> AR["Action Recognition"]
+  end
+
+  POSE <-->|Switch AR / Switch Pose| AR
+
+  POSE --> POSE_OUT["Per image: YOLO pose .txt next to image"]
+  AR --> AR_OUT["Per image: YOLO det .txt + classes.txt in folder"]
+```
+
+### 3. Pose mode — user journey (happy path)
+
+```mermaid
+flowchart TD
+  A["Choose root directory with image subfolders"] --> B["Next / Previous folder"]
+  B --> C{"Folder has keypoints.txt?"}
+  C -->|Yes — treated as labeled| D["Predict loads existing .txt overlays only"]
+  C -->|No — active annotation| E["Predict runs model on current image"]
+  E --> F["Edit: drag bboxes / keypoints, Mapping…, Add KP, W bbox"]
+  F --> G["Save label → one YOLO pose row per person per .txt"]
+  D --> F
+  B --> H["Optional: Auto-annotate folder — thread writes labels"]
+```
+
+### 4. Pose mode — tools and shortcuts (what touches what)
+
+```mermaid
+flowchart TB
+  subgraph left [Left column — project and settings]
+    ROOT["Root + folder navigation"]
+    SET["Model path, device, conf, …"]
+    MAP["Mapping… — keypoint schema"]
+    MISC["custom_classes.txt merge"]
+  end
+
+  subgraph center [Center — preview]
+    PV["Image + overlays: bboxes, handles, keypoints"]
+  end
+
+  subgraph right [Right — tools strip]
+    NAV["Next / Prev image — A D global in Pose"]
+    PRED["Predict / Preview"]
+    SAVE["Save label — Auto save toggle"]
+    ANN["Auto-annotate folder"]
+    KP["KP# + Person + Add keypoint click bbox hit-test"]
+    CLIP["Ctrl+V bbox — Ctrl+B keypoints multi-person"]
+    WKEY["W crosshair bbox"]
+  end
+
+  left --> PRED
+  SET --> PRED
+  MAP --> PV
+  right --> PV
+  PV --> SAVE
+```
+
+### 5. Action Recognition mode — compact flow
+
+```mermaid
+flowchart LR
+  O["Open Dir… images"] --> L["Class list + optional Escape clear"]
+  L --> D["W draw box or right-click box"]
+  D --> S["Save / Autosave on Prev Next"]
+  D --> P["Ctrl+V bbox from cache on folder change"]
+  L --> Q{"Class selected?"}
+  Q -->|Yes| D
+  Q -->|No| DLG["Dialog pick class on draw or paste"]
+  DLG --> D
+```
+
+### 6. Label files on disk (both modes)
+
+```mermaid
+flowchart TB
+  subgraph pose_files [Pose mode artifacts]
+    T1["Per-image label file .txt YOLO pose rows"]
+    T2["keypoints.txt optional folder marker + schema when present"]
+    T3["pose_annotator/data/custom_classes.txt extra slot names"]
+  end
+
+  subgraph ar_files [AR mode artifacts]
+    A1["Per-image .txt class cx cy w h normalized"]
+    A2["classes.txt in that image folder"]
+    A3["pose_annotator/data/ar_classes.txt global class list"]
+  end
+```
+
+### 7. CLI vs GUI (who writes where)
+
+| Path | Role |
+|------|------|
+| **`cus-keypoints-gui`** | Interactive Pose + AR; Pose saves **`.txt` next to each image**; settings in the window. |
+| **`cus-keypoints` CLI** | Batch pose inference via `auto_annotate.py`; default output is a **separate labels tree** (see CLI `--labels-dir`), unless your build uses “same folder” flags. |
+
+---
+
 ## Quick start
 
 1. Create conda env and install PyTorch (GPU optional) — see [Install](#install).
