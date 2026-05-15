@@ -108,15 +108,47 @@ class ARRectItem(QGraphicsRectItem):
         self._label.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
         self._label.setPos(rect.topLeft() + QPointF(2, 2))
 
-    def _apply_style(self):
-        col = QColor(0, 191, 255)
-        pen = QPen(col, 2)
-        self.setPen(pen); self.setBrush(QBrush(QColor(col.red(), col.green(), col.blue(), 35)))
+    def _apply_style(self, hovered=False):
+        colors = [
+            QColor(255, 56, 56), QColor(255, 157, 151), QColor(255, 112, 31),
+            QColor(255, 178, 29), QColor(207, 210, 49), QColor(72, 249, 10),
+            QColor(146, 204, 23), QColor(61, 219, 134), QColor(26, 147, 52),
+            QColor(0, 212, 187), QColor(44, 153, 168), QColor(0, 194, 255),
+            QColor(52, 69, 147), QColor(100, 115, 255), QColor(0, 24, 236),
+            QColor(132, 56, 255), QColor(82, 0, 133), QColor(203, 56, 255),
+            QColor(255, 149, 200), QColor(255, 55, 199)
+        ]
+        col = colors[self.cls_id % len(colors)]
+        is_selected = self.isSelected()
+        
+        # Highlighting logic: Darker/Thicker if selected or hovered
+        pen_width = 3 if (is_selected or hovered) else 1
+        pen = QPen(col, pen_width)
+        if is_selected:
+            pen.setStyle(Qt.PenStyle.SolidLine)
+            alpha = 120
+        elif hovered:
+            alpha = 100
+        else:
+            alpha = 40 # Light for others
+            
+        self.setPen(pen)
+        self.setBrush(QBrush(QColor(col.red(), col.green(), col.blue(), alpha)))
+
+    def hoverEnterEvent(self, event):
+        self._apply_style(hovered=True)
+        super().hoverEnterEvent(event)
+
+    def hoverLeaveEvent(self, event):
+        self._apply_style(hovered=False)
+        super().hoverLeaveEvent(event)
 
     def scene_rect(self): return self.rect().translated(self.pos())
 
     def itemChange(self, change, value):
-        if change == QGraphicsItem.GraphicsItemChange.ItemPositionHasChanged:
+        if change == QGraphicsItem.GraphicsItemChange.ItemSelectedHasChanged:
+            self._apply_style()
+        elif change == QGraphicsItem.GraphicsItemChange.ItemPositionHasChanged:
             if self._page.viewer._resize_item is self: self._page.viewer._update_handle_positions()
         return super().itemChange(change, value)
 
@@ -139,6 +171,7 @@ class ARRectItem(QGraphicsRectItem):
 
     def set_class(self, cid, name):
         self.cls_id = cid; self._label.setText(f"{cid}: {name}")
+        self._apply_style()
 
 # ---------------------------------------------------------------------------
 # Graphics View (Viewer)
@@ -154,6 +187,7 @@ class ARViewer(QGraphicsView):
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
         self.setStyleSheet("background: #000; border: none;")
         self._resize_item, self._handles, self._draw_mode, self._rubber = None, [], False, None
+        self.setMouseTracking(True); self._mouse_pos = None
 
     def load_image(self, path):
         pix = QPixmap(str(path))
@@ -197,21 +231,47 @@ class ARViewer(QGraphicsView):
     def set_draw_mode(self, on):
         self._draw_mode = on; self.setDragMode(QGraphicsView.DragMode.NoDrag if on else QGraphicsView.DragMode.ScrollHandDrag)
         self.setCursor(Qt.CursorShape.CrossCursor if on else Qt.CursorShape.ArrowCursor)
+        if not on: self._mouse_pos = None; self.scene().invalidate(self.sceneRect(), QGraphicsScene.SceneLayer.ForegroundLayer)
+
+    def leaveEvent(self, event):
+        self._mouse_pos = None; self.scene().invalidate(self.sceneRect(), QGraphicsScene.SceneLayer.ForegroundLayer)
+        super().leaveEvent(event)
 
     def mousePressEvent(self, event):
-        for item in self.items(event.pos()):
-            if isinstance(item, (ResizeHandle, ARRectItem)):
-                super().mousePressEvent(event); return
+        scene_pos = self.mapToScene(event.pos())
+        
+        # In Draw Mode, we only select if clicking in the "center" of a box
         if self._draw_mode and event.button() == Qt.MouseButton.LeftButton:
-            sp = self.mapToScene(event.pos()); self._start_draw = sp
-            self._rubber = QGraphicsRectItem(QRectF(sp, sp))
-            self._rubber.setPen(QPen(Qt.GlobalColor.yellow, 1, Qt.PenStyle.DashLine))
-            self._scene.addItem(self._rubber); event.accept(); return
+            target_item = None
+            for item in self.items(event.pos()):
+                if isinstance(item, ARRectItem):
+                    target_item = item; break
+                if isinstance(item, ResizeHandle): # Always allow handles
+                    super().mousePressEvent(event); return
+
+            is_center_click = False
+            if target_item:
+                r = target_item.scene_rect()
+                # Center zone: 40% of the box
+                center_q = QRectF(r.x() + r.width()*0.3, r.y() + r.height()*0.3, r.width()*0.4, r.height()*0.4)
+                if center_q.contains(scene_pos):
+                    is_center_click = True
+            
+            if not is_center_click:
+                self._start_draw = scene_pos
+                self._rubber = QGraphicsRectItem(QRectF(scene_pos, scene_pos))
+                self._rubber.setPen(QPen(Qt.GlobalColor.yellow, 1, Qt.PenStyle.DashLine))
+                self._scene.addItem(self._rubber)
+                event.accept(); return
+
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
+        self._mouse_pos = self.mapToScene(event.pos())
+        if self._draw_mode:
+            self.scene().invalidate(self.sceneRect(), QGraphicsScene.SceneLayer.ForegroundLayer)
         if self._draw_mode and self._rubber:
-            self._rubber.setRect(QRectF(self._start_draw, self.mapToScene(event.pos())).normalized())
+            self._rubber.setRect(QRectF(self._start_draw, self._mouse_pos).normalized())
         else: super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
@@ -219,6 +279,20 @@ class ARViewer(QGraphicsView):
             rect = self._rubber.rect().normalized(); self._scene.removeItem(self._rubber); self._rubber = None
             if rect.width() > 5 and rect.height() > 5: self._page.on_box_drawn(rect)
         else: super().mouseReleaseEvent(event)
+
+    def drawForeground(self, painter, rect):
+        super().drawForeground(painter, rect)
+        if self._draw_mode and self._mouse_pos:
+            # Draw crosshair spanning the visible area
+            painter.setPen(QPen(QColor(255, 255, 255, 150), 0)) # White-ish semi-transparent
+            x, y = self._mouse_pos.x(), self._mouse_pos.y()
+            painter.drawLine(QPointF(x, rect.top()), QPointF(x, rect.bottom()))
+            painter.drawLine(QPointF(rect.left(), y), QPointF(rect.right(), y))
+            
+            # Draw a black 1px line for contrast
+            painter.setPen(QPen(Qt.GlobalColor.black, 0))
+            painter.drawLine(QPointF(x, rect.top()), QPointF(x, rect.bottom()))
+            painter.drawLine(QPointF(rect.left(), y), QPointF(rect.right(), y))
 
 # ---------------------------------------------------------------------------
 # Class Editor Dialog
