@@ -379,7 +379,9 @@ class ActionRecognitionPage(QWidget):
         self.btn_draw = create_tool_btn("Create Box", QStyle.StandardPixmap.SP_TitleBarNormalButton, checkable=True)
         save_btn = create_tool_btn("Save", QStyle.StandardPixmap.SP_DialogSaveButton)
         save_btn.clicked.connect(self.save_current)
-        tv.addWidget(self.btn_draw); tv.addWidget(save_btn)
+        self.btn_auto = create_tool_btn("Auto Annotate", QStyle.StandardPixmap.SP_ComputerIcon)
+        self.btn_auto.clicked.connect(self._run_auto_annotate)
+        tv.addWidget(self.btn_draw); tv.addWidget(save_btn); tv.addWidget(self.btn_auto)
         lv.addWidget(tool_grp)
 
         # Properties Group
@@ -790,6 +792,129 @@ class ActionRecognitionPage(QWidget):
             for entry in self._all_bboxes_clipboard:
                 xc, yc, bw, bh = entry['geom']
                 self._add_item(entry['cid'], entry['name'], QRectF((xc-bw/2)*W, (yc-bh/2)*H, bw*W, bh*H))
+
+    def _run_auto_annotate(self):
+        if not self._images:
+            QMessageBox.warning(self, "Warning", "No images loaded.")
+            return
+            
+        if self.chk_autosave.isChecked():
+            self.save_current()
+        
+        from PySide6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QDialogButtonBox, QPushButton, QFileDialog, QLineEdit, QProgressDialog
+        
+        class ARAutoAnnotateDialog(QDialog):
+            def __init__(self, custom_classes, parent=None):
+                super().__init__(parent)
+                self.setWindowTitle("Auto Annotate Settings")
+                self.setMinimumWidth(450)
+                self.model = None
+                
+                layout = QVBoxLayout(self)
+                
+                layout.addWidget(QLabel("1. YOLO Model Path:"))
+                h_layout = QHBoxLayout()
+                self.txt_model = QLineEdit('yolo11n.pt')
+                h_layout.addWidget(self.txt_model)
+                btn_browse = QPushButton("Browse...")
+                btn_browse.clicked.connect(self._browse)
+                h_layout.addWidget(btn_browse)
+                btn_load = QPushButton("Load")
+                btn_load.clicked.connect(self._load_model)
+                h_layout.addWidget(btn_load)
+                layout.addLayout(h_layout)
+                
+                layout.addWidget(QLabel("2. Select YOLO Class to detect:"))
+                self.cb_yolo = QComboBox()
+                layout.addWidget(self.cb_yolo)
+                
+                layout.addWidget(QLabel("3. Map to Custom Class:"))
+                self.cb_custom = QComboBox()
+                for idx, name in enumerate(custom_classes):
+                    self.cb_custom.addItem(f"{idx}: {name}", idx)
+                layout.addWidget(self.cb_custom)
+                
+                self.btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+                self.btns.accepted.connect(self.accept)
+                self.btns.rejected.connect(self.reject)
+                self.btns.button(QDialogButtonBox.StandardButton.Ok).setEnabled(False)
+                layout.addWidget(self.btns)
+                
+                self._load_model()
+                
+            def _browse(self):
+                p, _ = QFileDialog.getOpenFileName(self, "Select YOLO Model", "", "PyTorch Models (*.pt)")
+                if p:
+                    self.txt_model.setText(p)
+                    self._load_model()
+                    
+            def _load_model(self):
+                path = self.txt_model.text().strip()
+                if not path: return
+                self.cb_yolo.clear()
+                self.btns.button(QDialogButtonBox.StandardButton.Ok).setEnabled(False)
+                try:
+                    from ultralytics import YOLO
+                    self.model = YOLO(path)
+                    for idx, name in self.model.names.items():
+                        self.cb_yolo.addItem(f"{idx}: {name}", idx)
+                    for i in range(self.cb_yolo.count()):
+                        if "person" in self.cb_yolo.itemText(i).lower():
+                            self.cb_yolo.setCurrentIndex(i)
+                            break
+                    self.btns.button(QDialogButtonBox.StandardButton.Ok).setEnabled(True)
+                except Exception as e:
+                    QMessageBox.critical(self, "Error", f"Could not load model:\\n{e}")
+                    self.model = None
+                    
+            def get_results(self):
+                return self.model, int(self.cb_yolo.currentData()), int(self.cb_custom.currentData())
+
+        dlg = ARAutoAnnotateDialog(self._class_names_ordered(), self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+            
+        model, yolo_cls_id, custom_cls_id = dlg.get_results()
+        
+        progress = QProgressDialog("Annotating images...", "Cancel", 0, len(self._images), self)
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        
+        for i, img_path in enumerate(self._images):
+            if progress.wasCanceled():
+                break
+            progress.setValue(i)
+            QApplication.processEvents()
+            
+            try:
+                results = model.predict(source=str(img_path), verbose=False)
+                if not results: continue
+                result = results[0]
+                boxes = result.boxes
+                if boxes is None or len(boxes) == 0: continue
+                
+                txt_path = img_path.with_suffix(".txt")
+                existing_lines = []
+                if txt_path.exists():
+                    existing_lines = txt_path.read_text(encoding="utf-8").splitlines()
+                    
+                new_lines = []
+                cls = boxes.cls.cpu().numpy()
+                xywhn = boxes.xywhn.cpu().numpy()
+                
+                for j in range(len(boxes)):
+                    if int(cls[j]) == yolo_cls_id:
+                        xc, yc, w, h = xywhn[j]
+                        new_lines.append(f"{custom_cls_id} {xc:.6f} {yc:.6f} {w:.6f} {h:.6f}")
+                        
+                if new_lines:
+                    all_lines = existing_lines + new_lines
+                    txt_path.write_text("\n".join(all_lines), encoding="utf-8")
+            except Exception as e:
+                print(f"Error annotating {img_path}: {e}")
+                
+        progress.setValue(len(self._images))
+        QMessageBox.information(self, "Done", "Auto annotation completed.")
+        self._load_image_by_index(self._index, force_list_update=True)
 
     def save_current(self):
         self._flash_sc(self.lbl_sc_ctrl_s)

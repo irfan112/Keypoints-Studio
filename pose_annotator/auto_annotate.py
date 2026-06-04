@@ -8,8 +8,6 @@ from typing import Iterable, Mapping, Sequence
 
 import numpy as np
 from tqdm import tqdm
-from ultralytics import YOLO
-from ultralytics.engine.results import Results
 
 from pose_annotator.formats import PoseLabelLine, visibility_from_confidence
 
@@ -64,7 +62,7 @@ def label_path_next_to_image(image_path: Path) -> Path:
 
 
 def results_to_lines(
-    result: Results,
+    result,
     box_conf_threshold: float,
     kpt_conf_threshold: float,
     coord_decimals: int,
@@ -159,6 +157,8 @@ def run_auto_annotate(
     If ``labels_same_folder_as_images`` is True, each ``.txt`` is written next to its image;
     ``labels_dir`` is ignored for output paths (CLI/GUI backward compatibility uses the flag).
     """
+    from ultralytics import YOLO
+    
     images_dir = images_dir.resolve()
     if not images_dir.is_dir():
         raise FileNotFoundError(f"Images directory not found: {images_dir}")
@@ -197,7 +197,7 @@ def run_auto_annotate(
         desc="Annotating",
         unit="batch",
     ):
-        batch_results: list[Results] = model.predict(
+        batch_results = model.predict(
             source=[str(p) for p in chunk],
             imgsz=imgsz,
             conf=box_conf,

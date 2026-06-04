@@ -1,6 +1,2 @@
-# Action Recognition / detection classes (one per line).
-# Class ID is the line index starting at 0 (same idea as labelImg predefined_classes.txt).
-person
-wave
-sit
-stand
+DO
+DC

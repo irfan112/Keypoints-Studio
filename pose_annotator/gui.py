@@ -57,7 +57,6 @@ from PySide6.QtWidgets import (
     QStackedWidget,
 )
 from ultralytics import YOLO
-
 from pose_annotator.ar_page import ActionRecognitionPage
 from pose_annotator.auto_annotate import iter_images, run_auto_annotate
 from pose_annotator.formats import PoseLabelLine
@@ -631,17 +630,39 @@ class KeypointDef:
 
 
 def _default_keypoint_defs() -> dict[int, KeypointDef]:
-    # Default: your mapping as output slots (with names) + ability to add custom later.
+    """Full 18-slot default mapping (13 YOLO + 5 custom), matching the project schema."""
     out: dict[int, KeypointDef] = {}
-    for out_slot, yolo_slot in DEFAULT_SLOT_MAP.items():
-        nm = (
-            YOLO_KPT_NAMES[yolo_slot - 1]
-            if 1 <= yolo_slot <= len(YOLO_KPT_NAMES)
-            else f"yolo_{yolo_slot}"
-        )
-        out[out_slot] = KeypointDef(
-            slot=out_slot, name=nm, source="yolo", yolo_slot=yolo_slot
-        )
+
+    # --- YOLO-mapped keypoints ---
+    yolo_slots: dict[int, tuple[int, str]] = {
+        1:  (11, "Right Wrist"),
+        2:  (10, "Left Wrist"),
+        3:  (9,  "Right Elbow"),
+        4:  (8,  "Left Elbow"),
+        5:  (7,  "Right Shoulder"),
+        6:  (6,  "Left Shoulder"),
+        8:  (1,  "Nose"),
+        10: (13, "Right Hip"),
+        11: (12, "Left Hip"),
+        13: (15, "Right Knee"),
+        14: (14, "Left Knee"),
+        15: (17, "Right Ankle"),
+        16: (16, "Left Ankle"),
+    }
+    for out_slot, (yolo_slot, name) in yolo_slots.items():
+        out[out_slot] = KeypointDef(slot=out_slot, name=name, source="yolo", yolo_slot=yolo_slot)
+
+    # --- Custom keypoints ---
+    custom_slots: dict[int, str] = {
+        7:  "Trachea",
+        9:  "Forehead",
+        12: "Sacrum",
+        17: "Right_FootIndex",
+        18: "Left_FootIndex",
+    }
+    for out_slot, name in custom_slots.items():
+        out[out_slot] = KeypointDef(slot=out_slot, name=name, source="custom", yolo_slot=None)
+
     return out
 
 
@@ -1084,7 +1105,7 @@ class MainWindow(QMainWindow):
         settings = QGroupBox("Model settings")
         form = QFormLayout(settings)
 
-        self.model_edit = QLineEdit("yolo26x-pose.pt")
+        self.model_edit = QLineEdit("yoloposebest.pt")
         self.device_edit = QLineEdit("0")
         self.imgsz_spin = QSpinBox()
         self.imgsz_spin.setRange(128, 4096)
@@ -1147,7 +1168,11 @@ class MainWindow(QMainWindow):
         self.mapping_label.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse
         )
-        self.mapping_label.setStyleSheet("QLabel { color: #444; }")
+        bg_color = self.palette().color(self.palette().ColorRole.Window)
+        if bg_color.lightness() < 128:
+            self.mapping_label.setStyleSheet("QLabel { color: #eee; }")
+        else:
+            self.mapping_label.setStyleSheet("QLabel { color: #444; }")
         self.mapping_label.setWordWrap(True)
         mapping_layout.addLayout(row)
         mapping_layout.addWidget(self.mapping_label)
@@ -1442,7 +1467,11 @@ class MainWindow(QMainWindow):
             name = d.name
             text = QLabel(f"{name}  →  {slot}")
             text.setWordWrap(True)
-            text.setStyleSheet("QLabel { color: #222; }")
+            bg_color = self.palette().color(self.palette().ColorRole.Window)
+            if bg_color.lightness() < 128:
+                text.setStyleSheet("QLabel { color: #eee; }")
+            else:
+                text.setStyleSheet("QLabel { color: #222; }")
 
             hl.addWidget(dot)
             hl.addWidget(text, stretch=1)
@@ -2535,7 +2564,7 @@ class MainWindow(QMainWindow):
             recursive=bool(self.recursive_check.isChecked()),
             decimals=int(self.decimals_spin.value()),
             keypoint_slot_map=(self._active_map()),
-            output_kpt_count=(17 if self._active_map() else None),
+            output_kpt_count=(18 if self._active_map() else None),
         )
         thread = QThread()
         worker.moveToThread(thread)
