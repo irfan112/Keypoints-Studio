@@ -42,8 +42,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--model",
         type=str,
-        default="yolo26x-pose.pt",
-        help="Ultralytics pose weights (default: yolo26x-pose.pt; downloads on first use).",
+        default="yoloposebest.pt",
+        help="Ultralytics pose weights (default: yoloposebest.pt; downloads on first use).",
     )
     p.add_argument(
         "--device",
