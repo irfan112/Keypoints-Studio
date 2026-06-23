@@ -48,6 +48,10 @@ def _to_qpixmap(rgb: np.ndarray) -> QPixmap:
     qimg = QImage(rgb.data, w, h, 3 * w, QImage.Format.Format_RGB888)
     return QPixmap.fromImage(qimg.copy())
 
+def _get_class_color(cls_id: int) -> QColor:
+    hue = (int(cls_id) * 137) % 360
+    return QColor.fromHsv(hue, 255, 220)
+
 # ---------------------------------------------------------------------------
 # Resize Handle (Dots)
 # ---------------------------------------------------------------------------
@@ -58,7 +62,9 @@ class ResizeHandle(QGraphicsEllipseItem):
         super().__init__(QRectF(-self._SIZE/2, -self._SIZE/2, self._SIZE, self._SIZE))
         self.h_frac, self.v_frac = h_frac, v_frac
         self._viewer = viewer
-        self.setPen(QPen(Qt.GlobalColor.white, 2))
+        pen = QPen(Qt.GlobalColor.white, 2)
+        pen.setCosmetic(True)
+        self.setPen(pen)
         self.setBrush(QBrush(QColor(0, 255, 127)))
         self.setZValue(1000)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations, True)
@@ -109,21 +115,13 @@ class ARRectItem(QGraphicsRectItem):
         self._label.setPos(rect.topLeft() + QPointF(2, 2))
 
     def _apply_style(self, hovered=False):
-        colors = [
-            QColor(255, 56, 56), QColor(255, 157, 151), QColor(255, 112, 31),
-            QColor(255, 178, 29), QColor(207, 210, 49), QColor(72, 249, 10),
-            QColor(146, 204, 23), QColor(61, 219, 134), QColor(26, 147, 52),
-            QColor(0, 212, 187), QColor(44, 153, 168), QColor(0, 194, 255),
-            QColor(52, 69, 147), QColor(100, 115, 255), QColor(0, 24, 236),
-            QColor(132, 56, 255), QColor(82, 0, 133), QColor(203, 56, 255),
-            QColor(255, 149, 200), QColor(255, 55, 199)
-        ]
-        col = colors[self.cls_id % len(colors)]
+        col = _get_class_color(self.cls_id)
         is_selected = self.isSelected()
         
         # Highlighting logic: Darker/Thicker if selected or hovered
         pen_width = 3 if (is_selected or hovered) else 1
         pen = QPen(col, pen_width)
+        pen.setCosmetic(True)
         if is_selected:
             pen.setStyle(Qt.PenStyle.SolidLine)
             alpha = 120
@@ -148,15 +146,26 @@ class ARRectItem(QGraphicsRectItem):
     def itemChange(self, change, value):
         if change == QGraphicsItem.GraphicsItemChange.ItemSelectedHasChanged:
             self._apply_style()
+            if not self._page.viewer._draw_mode:
+                if value:
+                    self._page.viewer.show_resize_handles(self)
+                else:
+                    if self._page.viewer._resize_item is self:
+                        self._page.viewer.hide_resize_handles()
         elif change == QGraphicsItem.GraphicsItemChange.ItemPositionHasChanged:
             if self._page.viewer._resize_item is self: self._page.viewer._update_handle_positions()
         return super().itemChange(change, value)
 
     def mouseDoubleClickEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
+        if not self._page.viewer._draw_mode and event.button() == Qt.MouseButton.LeftButton:
             self._page.viewer.show_resize_handles(self); event.accept()
+        else:
+            super().mouseDoubleClickEvent(event)
 
     def contextMenuEvent(self, event):
+        if self._page.viewer._draw_mode:
+            event.ignore()
+            return
         menu = QMenu(); edit_act = menu.addAction("✏  Edit Box")
         sub = menu.addMenu("Set Class"); names = self._page._class_names_ordered()
         for cid, nm in enumerate(names):
@@ -231,6 +240,12 @@ class ARViewer(QGraphicsView):
     def set_draw_mode(self, on):
         self._draw_mode = on; self.setDragMode(QGraphicsView.DragMode.NoDrag if on else QGraphicsView.DragMode.ScrollHandDrag)
         self.setCursor(Qt.CursorShape.CrossCursor if on else Qt.CursorShape.ArrowCursor)
+        if on:
+            self.hide_resize_handles()
+            self.scene().clearSelection()
+        for item in self._page._items:
+            item.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, not on)
+            item.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, not on)
         if not on: self._mouse_pos = None; self.scene().invalidate(self.sceneRect(), QGraphicsScene.SceneLayer.ForegroundLayer)
 
     def leaveEvent(self, event):
@@ -240,29 +255,21 @@ class ARViewer(QGraphicsView):
     def mousePressEvent(self, event):
         scene_pos = self.mapToScene(event.pos())
         
-        # In Draw Mode, we only select if clicking in the "center" of a box
+        # In Draw Mode, left-click always starts drawing a box
         if self._draw_mode and event.button() == Qt.MouseButton.LeftButton:
-            target_item = None
-            for item in self.items(event.pos()):
-                if isinstance(item, ARRectItem):
-                    target_item = item; break
-                if isinstance(item, ResizeHandle): # Always allow handles
-                    super().mousePressEvent(event); return
-
-            is_center_click = False
-            if target_item:
-                r = target_item.scene_rect()
-                # Center zone: 40% of the box
-                center_q = QRectF(r.x() + r.width()*0.3, r.y() + r.height()*0.3, r.width()*0.4, r.height()*0.4)
-                if center_q.contains(scene_pos):
-                    is_center_click = True
+            self._start_draw = scene_pos
+            self._rubber = QGraphicsRectItem(QRectF(scene_pos, scene_pos))
+            r = self._page.class_list.currentRow()
+            cid = r if r >= 0 else 0
+            col = _get_class_color(cid)
             
-            if not is_center_click:
-                self._start_draw = scene_pos
-                self._rubber = QGraphicsRectItem(QRectF(scene_pos, scene_pos))
-                self._rubber.setPen(QPen(Qt.GlobalColor.yellow, 1, Qt.PenStyle.DashLine))
-                self._scene.addItem(self._rubber)
-                event.accept(); return
+            pen = QPen(col, 1, Qt.PenStyle.DashLine)
+            pen.setCosmetic(True)
+            self._rubber.setPen(pen)
+            self._rubber.setBrush(QBrush(QColor(col.red(), col.green(), col.blue(), 40)))
+            self._scene.addItem(self._rubber)
+            event.accept()
+            return
 
         super().mousePressEvent(event)
 
@@ -560,16 +567,27 @@ class ActionRecognitionPage(QWidget):
 
     def _class_names_ordered(self): return [self.class_list.item(i).text() for i in range(self.class_list.count())]
 
+    def _update_class_list_items(self, names):
+        self.class_list.clear()
+        for cid, name in enumerate(names):
+            item = QListWidgetItem(name)
+            col = _get_class_color(cid)
+            item.setForeground(QBrush(col))
+            font = item.font()
+            font.setBold(True)
+            item.setFont(font)
+            self.class_list.addItem(item)
+
     def _open_class_editor(self):
         old_names = self._class_names_ordered(); dlg = ClassEditorDialog(old_names, self)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             new_names = dlg.get_names(); _ar_classes_path().write_text("\n".join(new_names), encoding="utf-8")
-            self.class_list.clear(); self.class_list.addItems(new_names)
+            self._update_class_list_items(new_names)
 
     def _load_classes(self):
         p = _ar_classes_path(); p.parent.mkdir(parents=True, exist_ok=True)
         if not p.exists(): p.write_text("person\nobject\n", encoding="utf-8")
-        self.class_list.clear(); self.class_list.addItems(p.read_text(encoding="utf-8").splitlines())
+        self._update_class_list_items(p.read_text(encoding="utf-8").splitlines())
 
     def _open_dir(self):
         d = QFileDialog.getExistingDirectory(self, "Open Folder")
@@ -689,6 +707,9 @@ class ActionRecognitionPage(QWidget):
 
     def _add_item(self, cid, name, rect):
         it = ARRectItem(rect, cid, name, self)
+        on = self.viewer._draw_mode
+        it.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, not on)
+        it.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, not on)
         self.viewer._scene.addItem(it); it.setZValue(10); self._items.append(it); return it
 
     def _remove_rect_item(self, it):
