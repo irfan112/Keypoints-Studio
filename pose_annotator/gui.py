@@ -523,7 +523,9 @@ class ResizableBBox(QGraphicsRectItem):
         handle_size: float = 8.0,
     ) -> None:
         super().__init__(rect)
-        self.setPen(QPen(QColor(255, 255, 0), 1))
+        pen = QPen(QColor(255, 255, 0), 1)
+        pen.setCosmetic(True)
+        self.setPen(pen)
         self.setBrush(Qt.BrushStyle.NoBrush)
         self.setFlag(QGraphicsRectItem.GraphicsItemFlag.ItemIsSelectable, True)
         self.setAcceptHoverEvents(True)
