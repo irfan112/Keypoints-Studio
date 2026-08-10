@@ -104,15 +104,12 @@ class ARRectItem(QGraphicsRectItem):
     def __init__(self, rect, cls_id, cls_name, page):
         super().__init__(rect)
         self.cls_id, self._page = cls_id, page
+        self._label_text = f"{cls_id}: {cls_name}"
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, True)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges, True)
         self.setAcceptHoverEvents(True)
         self._apply_style()
-        self._label = QGraphicsSimpleTextItem(f"{cls_id}: {cls_name}", self)
-        self._label.setBrush(Qt.GlobalColor.white)
-        self._label.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
-        self._label.setPos(rect.topLeft() + QPointF(2, 2))
 
     def _apply_style(self, hovered=False):
         col = _get_class_color(self.cls_id)
@@ -132,6 +129,26 @@ class ARRectItem(QGraphicsRectItem):
             
         self.setPen(pen)
         self.setBrush(QBrush(QColor(col.red(), col.green(), col.blue(), alpha)))
+
+    def paint(self, painter, option, widget=None):
+        super().paint(painter, option, widget)
+        if not self._label_text:
+            return
+        # Map the rect's top-left from local → device (screen) coords
+        tl = self.rect().topLeft()
+        screen_pt = painter.transform().map(tl)
+        sx, sy = int(screen_pt.x()), int(screen_pt.y())
+        painter.save()
+        painter.resetTransform()  # draw in raw screen pixels
+        font = QFont("Segoe UI", 9, QFont.Weight.Bold)
+        painter.setFont(font)
+        # Dark shadow for readability
+        painter.setPen(QColor(0, 0, 0, 200))
+        painter.drawText(sx + 3, sy + 15, self._label_text)
+        # White label text
+        painter.setPen(Qt.GlobalColor.white)
+        painter.drawText(sx + 2, sy + 14, self._label_text)
+        painter.restore()
 
     def hoverEnterEvent(self, event):
         self._apply_style(hovered=True)
@@ -179,8 +196,10 @@ class ARRectItem(QGraphicsRectItem):
         event.accept()
 
     def set_class(self, cid, name):
-        self.cls_id = cid; self._label.setText(f"{cid}: {name}")
+        self.cls_id = cid
+        self._label_text = f"{cid}: {name}"
         self._apply_style()
+        self.update()  # force repaint so label refreshes
 
 # ---------------------------------------------------------------------------
 # Graphics View (Viewer)
